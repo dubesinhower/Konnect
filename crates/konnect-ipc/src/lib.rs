@@ -6,5 +6,8 @@ pub mod client;
 pub mod transform;
 pub mod types;
 
-pub use client::{BoardTargetError, IpcFailure, KiCadIpcClient, TransportUnreachable};
+pub use client::{
+    ApiStatusError, BoardTargetError, IpcDocumentObservationError, IpcFailure, KiCadIpcClient,
+    TransportUnreachable,
+};
 pub use types::*;
