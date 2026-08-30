@@ -1803,7 +1803,7 @@ mod connectivity_safe_batch_delete_tests {
     }
 
     #[tokio::test]
-    async fn duplicate_top_level_uuid_is_stale_and_unchanged() {
+    async fn duplicate_top_level_uuid_is_ambiguous_and_unchanged() {
         let closing = CONNECTIVITY.rfind("\n)").unwrap();
         let duplicate =
             "\t(junction\n\t\t(at 1 1)\n\t\t(uuid \"6f08a78f-7ec2-45e6-ba39-1d930be32b74\")\n\t)\n";
@@ -1821,7 +1821,10 @@ mod connectivity_safe_batch_delete_tests {
         .await
         .unwrap();
 
-        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 

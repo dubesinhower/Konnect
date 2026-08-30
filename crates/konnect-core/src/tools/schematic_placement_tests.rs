@@ -180,6 +180,7 @@ async fn native_placement_preserves_unique_and_reused_paths_with_committed_readb
                     .unwrap();
                 let mut identities = symbol.instance_paths();
                 identities.sort();
+                let observed_project = identities[0].0.clone();
                 assert_eq!(
                     identities,
                     expected
@@ -192,7 +193,7 @@ async fn native_placement_preserves_unique_and_reused_paths_with_committed_readb
                     entry["schematic"],
                     committed.filepath().display().to_string()
                 );
-                assert_eq!(entry["project"], "complex_hierarchy");
+                assert_eq!(entry["project"], observed_project);
                 assert_eq!(entry["added"], symbol.lib_id);
                 assert_eq!(entry["reference"], symbol.reference().unwrap());
                 assert_eq!(entry["value"], symbol.value_str().unwrap());

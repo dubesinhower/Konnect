@@ -16,6 +16,28 @@ observed segment rather than echoed from the request. Results add
 `preimage`, and `postcondition: "absent_from_trace_readback"`. No argument or
 tool was renamed or removed.
 
+## Unreleased: committed schematic component mutation readback (minor release)
+
+Schematic component placement, batch placement, field edits and renames, moves,
+rotations, annotations, and grouping now bind the selected symbol UUIDs before
+writing and build their success responses from one reload of the committed
+schematic. Existing response fields remain. Results add observed identity and
+placement evidence including `schematic`, `reference`, `uuid`, `lib_id`,
+`unit_count`, `units`, `fields`, coordinates, rotation, and instance paths or
+references where applicable. Grouping returns the same evidence per component.
+
+Missing, malformed, stale-revision, or wrong-document identities refuse with
+`stale_target`. Duplicate UUID, reference/unit, or property identities refuse
+with the new `ambiguous_target` kind and include their candidates whenever
+Konnect cannot prove one top-level symbol per bound UUID and one logical
+reference across its units. A
+post-write verification refusal can follow a committed write, so inspect and
+reload the saved schematic before retrying. A move commits the symbol placement
+before a separate junction-reconciliation write; if that second write or final
+readback refuses, the move can already be durable. This additive response
+change is planned for the next minor release; no tool or argument was renamed
+or removed.
+
 ## Unreleased: connectivity-safe component deletion (minor release)
 
 `delete_schematic_component`, `batch_delete`, and
@@ -33,9 +55,10 @@ each reference's observed unit count and UUIDs), `deleted_item_uuids`, and the
 same connectivity evidence fields. These values come from reloading the
 committed schematic rather than echoing requested selectors.
 
-Missing, protected, duplicate, malformed, stale, wrong-document, or
-editor-locked targets refuse with the existing `stale_target` kind before a
-write when Konnect cannot prove a unique safe deletion. A post-write readback
+Missing, protected, malformed, stale, wrong-document, or editor-locked targets
+refuse with `stale_target` before a write. Duplicate UUID or reference/unit
+identities refuse with `ambiguous_target` when Konnect cannot prove a unique
+safe deletion. A post-write readback
 that still observes a selected reference or UUID also returns `stale_target`;
 inspect and reload the saved schematic before retrying because that refusal can
 follow a committed write. This additive response change is planned for the next
