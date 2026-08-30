@@ -42,6 +42,9 @@ macro_rules! ipc {
                 )))
             }
             Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
+            Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+                return Ok(crate::tools::ipc_target_error_result(&error))
+            }
         }
     }};
 }
@@ -3208,6 +3211,9 @@ async fn handle_get_component_pads(
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => {}
         Err(konnect_ipc::IpcFailure::Rejected(message)) => {
             return Ok(CallToolResult::error(message));
+        }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error));
         }
     }
 
