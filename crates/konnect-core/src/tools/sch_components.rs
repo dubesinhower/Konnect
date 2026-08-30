@@ -804,89 +804,55 @@ async fn handle_delete_schematic_component(
         Ok(plan) => plan,
         Err(error) => return Ok(error.into_result()),
     };
-    if let Err(error) = commit_command(&sch_path, &plan.command) {
-        if let Some(refusal) = component_delete_commit_refusal(&sch_path, &error) {
-            return Ok(refusal);
-        }
-        return Err(error.into());
-    }
-
-    let committed = read_consistent(&sch_path)?;
-    let after_items = match indexed_uuid_items(&sch_path, &committed) {
-        Ok(items) => items,
-        Err(error) => return Ok(error.into_result()),
+    let outcome = match commit_component_deletion(&sch_path, plan)? {
+        Ok(outcome) => outcome,
+        Err(refusal) => return Ok(refusal),
     };
-    let after_tree = parse_sexp(&committed)?;
-    let remaining = extract_symbol_instances(&after_tree)
-        .into_iter()
-        .filter(|instance| instance.reference == reference)
-        .collect::<Vec<_>>();
-    if !remaining.is_empty() {
-        return Ok(ComponentDeleteTargetError::stale(
-            &sch_path,
-            format!(
-                "post-write readback still contains {} unit(s) of {reference}",
-                remaining.len()
-            ),
-        )
-        .into_result());
-    }
-    for uuid in plan.unit_uuids.iter().chain(&plan.marker_uuids) {
-        if after_items.contains_key(uuid) {
-            return Ok(ComponentDeleteTargetError::stale(
-                &sch_path,
-                format!("post-write readback still contains deleted item UUID {uuid}"),
-            )
-            .into_result());
-        }
-    }
-
-    let before_junctions = plan
-        .before_items
-        .iter()
-        .filter_map(|(uuid, item)| (item.kind == "junction").then_some(uuid.clone()))
-        .collect::<BTreeSet<_>>();
-    let after_junctions = after_items
-        .iter()
-        .filter_map(|(uuid, item)| (item.kind == "junction").then_some(uuid.clone()))
-        .collect::<BTreeSet<_>>();
-    let pruned_junctions = before_junctions
-        .difference(&after_junctions)
+    let unit_uuids = outcome
+        .units_by_reference
+        .get(&reference)
         .cloned()
-        .collect::<Vec<_>>();
-    let added_junctions = after_junctions
-        .difference(&before_junctions)
-        .cloned()
-        .collect::<Vec<_>>();
+        .unwrap_or_default();
 
     Ok(CallToolResult::json(&json!({
         "deleted": reference,
-        "deleted_units": plan.unit_uuids.len(),
-        "deleted_unit_uuids": plan.unit_uuids,
-        "removed_no_connects_count": plan.marker_uuids.len(),
-        "removed_no_connect_uuids": plan.marker_uuids,
-        "junctions_added_count": added_junctions.len(),
-        "junctions_added_uuids": added_junctions,
-        "junctions_pruned_count": pruned_junctions.len(),
-        "junctions_pruned_uuids": pruned_junctions
+        "deleted_units": unit_uuids.len(),
+        "deleted_unit_uuids": unit_uuids,
+        "removed_no_connects_count": outcome.marker_uuids.len(),
+        "removed_no_connect_uuids": outcome.marker_uuids,
+        "junctions_added_count": outcome.added_junctions.len(),
+        "junctions_added_uuids": outcome.added_junctions,
+        "junctions_pruned_count": outcome.pruned_junctions.len(),
+        "junctions_pruned_uuids": outcome.pruned_junctions
     })))
 }
 
 #[derive(Debug, Clone)]
-struct IndexedSchematicItem {
-    kind: String,
+pub(crate) struct IndexedSchematicItem {
+    pub(crate) kind: String,
     source: String,
 }
 
-struct ComponentDeletePlan {
+pub(crate) struct ComponentDeletePlan {
     command: SchematicCommand,
     before_items: BTreeMap<String, IndexedSchematicItem>,
     unit_uuids: Vec<String>,
+    units_by_reference: BTreeMap<String, Vec<String>>,
     marker_uuids: Vec<String>,
+    item_uuids: Vec<String>,
 }
 
 #[derive(Debug)]
-enum ComponentDeleteTargetError {
+pub(crate) struct ComponentDeleteOutcome {
+    pub(crate) units_by_reference: BTreeMap<String, Vec<String>>,
+    pub(crate) marker_uuids: Vec<String>,
+    pub(crate) item_uuids: Vec<String>,
+    pub(crate) added_junctions: Vec<String>,
+    pub(crate) pruned_junctions: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ComponentDeleteTargetError {
     Ambiguous {
         target: String,
         candidates: Vec<String>,
@@ -909,7 +875,7 @@ impl ComponentDeleteTargetError {
         Self::stale(path, error.to_string())
     }
 
-    fn into_result(self) -> CallToolResult {
+    pub(crate) fn into_result(self) -> CallToolResult {
         match self {
             Self::Ambiguous { target, candidates } => {
                 let reason = format!(
@@ -935,7 +901,7 @@ impl ComponentDeleteTargetError {
     }
 }
 
-fn indexed_uuid_items(
+pub(crate) fn indexed_uuid_items(
     path: &std::path::Path,
     content: &str,
 ) -> Result<BTreeMap<String, IndexedSchematicItem>, ComponentDeleteTargetError> {
@@ -985,28 +951,76 @@ fn plan_component_deletion(
     content: &str,
     reference: &str,
 ) -> Result<ComponentDeletePlan, ComponentDeleteTargetError> {
+    plan_component_deletions(path, content, &[reference.to_owned()])
+}
+
+pub(crate) fn plan_component_deletions(
+    path: &std::path::Path,
+    content: &str,
+    references: &[String],
+) -> Result<ComponentDeletePlan, ComponentDeleteTargetError> {
+    plan_component_and_item_deletions(path, content, references, &[])
+}
+
+pub(crate) fn plan_component_and_item_deletions(
+    path: &std::path::Path,
+    content: &str,
+    references: &[String],
+    item_uuids: &[String],
+) -> Result<ComponentDeletePlan, ComponentDeleteTargetError> {
+    let references = references.iter().cloned().collect::<BTreeSet<_>>();
+    let mut item_uuids = item_uuids.to_vec();
+    item_uuids.sort();
+    item_uuids.dedup();
+    if references.is_empty() && item_uuids.is_empty() {
+        return Err(ComponentDeleteTargetError::stale(
+            path,
+            "no schematic items were selected",
+        ));
+    }
+    let reference_label = if references.is_empty() {
+        "selected items".to_owned()
+    } else {
+        references.iter().cloned().collect::<Vec<_>>().join(", ")
+    };
     let tree =
         parse_sexp(content).map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
     let before_items = indexed_uuid_items(path, content)?;
+    for uuid in &item_uuids {
+        if !before_items.contains_key(uuid) {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("schematic item UUID {uuid} is not present"),
+            ));
+        }
+    }
     let instances = extract_symbol_instances(&tree);
     let selected = instances
         .iter()
-        .filter(|instance| instance.reference == reference)
+        .filter(|instance| references.contains(&instance.reference))
         .collect::<Vec<_>>();
-    if selected.is_empty() {
+    let found = selected
+        .iter()
+        .map(|instance| instance.reference.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(missing) = references.difference(&found).next() {
         return Err(ComponentDeleteTargetError::stale(
             path,
-            format!("component {reference} is not present"),
+            format!("component {missing} is not present"),
         ));
     }
 
-    let mut by_unit: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    let mut by_unit: BTreeMap<(String, u32), Vec<String>> = BTreeMap::new();
+    let mut units_by_reference: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut unit_uuids = Vec::new();
     for instance in &selected {
         let uuid = instance.uuid.clone().ok_or_else(|| {
             ComponentDeleteTargetError::stale(
                 path,
-                format!("component {reference} unit {} has no UUID", instance.unit),
+                format!(
+                    "component {} unit {} has no UUID",
+                    instance.reference, instance.unit
+                ),
             )
         })?;
         if before_items
@@ -1018,20 +1032,31 @@ fn plan_component_deletion(
                 format!("UUID {uuid} no longer identifies a top-level symbol"),
             ));
         }
-        by_unit.entry(instance.unit).or_default().push(uuid.clone());
+        by_unit
+            .entry((instance.reference.clone(), instance.unit))
+            .or_default()
+            .push(uuid.clone());
+        units_by_reference
+            .entry(instance.reference.clone())
+            .or_default()
+            .push(uuid.clone());
         unit_uuids.push(uuid);
     }
-    if let Some((unit, uuids)) = by_unit.iter().find(|(_, uuids)| uuids.len() > 1) {
+    if let Some(((reference, unit), uuids)) = by_unit.iter().find(|(_, uuids)| uuids.len() > 1) {
         return Err(ComponentDeleteTargetError::Ambiguous {
             target: format!("component {reference} unit {unit}"),
             candidates: uuids.clone(),
         });
     }
+    for uuids in units_by_reference.values_mut() {
+        uuids.sort();
+        uuids.dedup();
+    }
     unit_uuids.sort();
     unit_uuids.dedup();
     if unit_uuids.len() != selected.len() {
         return Err(ComponentDeleteTargetError::Ambiguous {
-            target: format!("component {reference}"),
+            target: format!("components {reference_label}"),
             candidates: unit_uuids,
         });
     }
@@ -1039,13 +1064,18 @@ fn plan_component_deletion(
     // Require every placed symbol's library definition to resolve before
     // deciding marker ownership or junction validity. Unknown pins are stale
     // state, not evidence that no pin remains at a coordinate.
-    let grouped = crate::tools::placed_pins_by_reference(&tree);
-    if grouped.len() != instances.len() {
-        return Err(ComponentDeleteTargetError::stale(
-            path,
-            "one or more placed symbols have unresolved library pin geometry",
-        ));
-    }
+    let grouped = if selected.is_empty() {
+        Vec::new()
+    } else {
+        let grouped = crate::tools::placed_pins_by_reference(&tree);
+        if grouped.len() != instances.len() {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                "one or more placed symbols have unresolved library pin geometry",
+            ));
+        }
+        grouped
+    };
     let selected_ids = unit_uuids.iter().cloned().collect::<BTreeSet<_>>();
     let mut affected = Vec::new();
     let mut remaining = Vec::new();
@@ -1095,10 +1125,15 @@ fn plan_component_deletion(
     marker_uuids.sort();
     marker_uuids.dedup();
 
-    let initial_ids = unit_uuids
+    let initial_uuid_set = unit_uuids
         .iter()
         .chain(&marker_uuids)
-        .map(|uuid| ItemId::new(uuid.clone()))
+        .chain(&item_uuids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let initial_ids = initial_uuid_set
+        .into_iter()
+        .map(ItemId::new)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
     let initial = SchematicCommand::delete_items(content, initial_ids, "prepare component delete")
@@ -1134,7 +1169,7 @@ fn plan_component_deletion(
                 .map(|uuid| ItemId::new(uuid.clone()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?,
-            format!("delete {reference} and dependent markers"),
+            format!("delete {reference_label} and dependent markers"),
         )
         .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
         changes.extend(command.changes);
@@ -1144,7 +1179,7 @@ fn plan_component_deletion(
             content,
             after_items[&uuid].source.clone(),
             ItemAnchor::EndOfDocument,
-            format!("restore junction after deleting {reference}"),
+            format!("restore junction after deleting {reference_label}"),
         )
         .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
         changes.extend(command.changes);
@@ -1155,15 +1190,18 @@ fn plan_component_deletion(
             ItemId::new(uuid.clone())
                 .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?,
             after_items[&uuid].source.clone(),
-            format!("reconcile {uuid} after deleting {reference}"),
+            format!("reconcile {uuid} after deleting {reference_label}"),
         )
         .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
         changes.extend(command.changes);
     }
-    let command =
-        SchematicCommand::from_changes(content, format!("delete component {reference}"), changes)
-            .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?
-            .requiring_unchanged_document();
+    let command = SchematicCommand::from_changes(
+        content,
+        format!("delete components {reference_label}"),
+        changes,
+    )
+    .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?
+    .requiring_unchanged_document();
     let prepared = prepare_command(path, content, &command)
         .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?
         .0;
@@ -1178,8 +1216,89 @@ fn plan_component_deletion(
         command,
         before_items,
         unit_uuids,
+        units_by_reference,
         marker_uuids,
+        item_uuids,
     })
+}
+
+pub(crate) fn commit_component_deletion(
+    path: &std::path::Path,
+    plan: ComponentDeletePlan,
+) -> anyhow::Result<Result<ComponentDeleteOutcome, CallToolResult>> {
+    if let Err(error) = commit_command(path, &plan.command) {
+        if let Some(refusal) = component_delete_commit_refusal(path, &error) {
+            return Ok(Err(refusal));
+        }
+        return Err(error.into());
+    }
+
+    let committed = read_consistent(path)?;
+    let after_items = match indexed_uuid_items(path, &committed) {
+        Ok(items) => items,
+        Err(error) => return Ok(Err(error.into_result())),
+    };
+    let after_tree = match parse_sexp(&committed) {
+        Ok(tree) => tree,
+        Err(error) => {
+            return Ok(Err(
+                ComponentDeleteTargetError::from_sexp(path, error).into_result()
+            ));
+        }
+    };
+    for reference in plan.units_by_reference.keys() {
+        let remaining = extract_symbol_instances(&after_tree)
+            .into_iter()
+            .filter(|instance| instance.reference == *reference)
+            .count();
+        if remaining != 0 {
+            return Ok(Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("post-write readback still contains {remaining} unit(s) of {reference}"),
+            )
+            .into_result()));
+        }
+    }
+    for uuid in plan
+        .unit_uuids
+        .iter()
+        .chain(&plan.marker_uuids)
+        .chain(&plan.item_uuids)
+    {
+        if after_items.contains_key(uuid) {
+            return Ok(Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("post-write readback still contains deleted item UUID {uuid}"),
+            )
+            .into_result()));
+        }
+    }
+
+    let before_junctions = plan
+        .before_items
+        .iter()
+        .filter_map(|(uuid, item)| (item.kind == "junction").then_some(uuid.clone()))
+        .collect::<BTreeSet<_>>();
+    let after_junctions = after_items
+        .iter()
+        .filter_map(|(uuid, item)| (item.kind == "junction").then_some(uuid.clone()))
+        .collect::<BTreeSet<_>>();
+    let pruned_junctions = before_junctions
+        .difference(&after_junctions)
+        .cloned()
+        .collect::<Vec<_>>();
+    let added_junctions = after_junctions
+        .difference(&before_junctions)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Ok(Ok(ComponentDeleteOutcome {
+        units_by_reference: plan.units_by_reference,
+        marker_uuids: plan.marker_uuids,
+        item_uuids: plan.item_uuids,
+        added_junctions,
+        pruned_junctions,
+    }))
 }
 
 fn component_delete_commit_refusal(
@@ -4710,7 +4829,10 @@ mod component_delete_connectivity_tests {
     #[tokio::test]
     async fn kicad_lock_is_structured_stale_and_preserves_the_file() {
         let (_directory, path) = fixture(CONNECTIVITY);
-        let lock = konnect_sexp::writer::kicad_editor_lock_path(&path).unwrap();
+        let lock = path.with_file_name(format!(
+            "~{}.lck",
+            path.file_name().unwrap().to_string_lossy()
+        ));
         std::fs::write(&lock, "locked").unwrap();
         let result = handle_delete_schematic_component(
             &json!({ "schematic": path, "reference": "R1" }),

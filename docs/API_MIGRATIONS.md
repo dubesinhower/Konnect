@@ -3,6 +3,31 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: connectivity-safe component deletion (minor release)
+
+`delete_schematic_component`, `batch_delete`, and
+`batch_delete_schematic_components` now resolve a complete logical component
+before writing, remove only no-connect markers owned exclusively by deleted
+pins, and reconcile junctions only at affected pin endpoints. Wires and labels
+remain, matching KiCad's plain-delete behavior. Selecting one placed-unit UUID
+through `batch_delete` deletes every placed unit of that reference.
+
+The existing single-delete fields (`deleted`, `deleted_units`) and batch fields
+(`deleted_count`, `deleted`, `errors`) remain. Single-delete results add
+`deleted_unit_uuids`, plus count-and-UUID evidence for removed no-connects and
+added or pruned junctions. Batch results add `deleted_components` (including
+each reference's observed unit count and UUIDs), `deleted_item_uuids`, and the
+same connectivity evidence fields. These values come from reloading the
+committed schematic rather than echoing requested selectors.
+
+Missing, protected, duplicate, malformed, stale, wrong-document, or
+editor-locked targets refuse with the existing `stale_target` kind before a
+write when Konnect cannot prove a unique safe deletion. A post-write readback
+that still observes a selected reference or UUID also returns `stale_target`;
+inspect and reload the saved schematic before retrying because that refusal can
+follow a committed write. This additive response change is planned for the next
+minor release; no tool or argument was renamed or removed.
+
 ## Unreleased: complete schematic placement instances (minor release)
 
 `add_schematic_component`, `batch_place_components`, and `add_power_symbol`
