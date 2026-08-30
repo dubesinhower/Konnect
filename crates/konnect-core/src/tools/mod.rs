@@ -1332,6 +1332,10 @@ pub struct SheetInstanceContext {
     pub project_name: String,
     /// `/root-uuid[/sheet-uuid…]`, the path from the root down to this sheet.
     pub instance_path: String,
+    /// Every structurally observed path to this document. A reused child sheet
+    /// has one entry per hierarchy instance; document-wide edits affect all of
+    /// them and must never silently choose the first.
+    pub instance_paths: Vec<String>,
     /// Whether this sheet was reached from a root other than itself.
     pub is_child_sheet: bool,
 }
@@ -1358,6 +1362,10 @@ pub(crate) enum SchematicTargetError {
         target: std::path::PathBuf,
         roots: Vec<std::path::PathBuf>,
     },
+    StaleTarget {
+        target: std::path::PathBuf,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for SchematicTargetError {
@@ -1373,6 +1381,13 @@ impl std::fmt::Display for SchematicTargetError {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::StaleTarget { target, reason } => {
+                write!(
+                    formatter,
+                    "schematic '{}' is stale: {reason}",
+                    target.display()
+                )
+            }
         }
     }
 }
@@ -1401,6 +1416,18 @@ impl SchematicTargetError {
                     ),
                 )
             }
+            Self::StaleTarget { target, reason } => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::StaleTarget {
+                    target: target.display().to_string(),
+                    reason: reason.clone(),
+                },
+                format!(
+                    "Schematic '{}' does not match its structurally observed target state: {}. \
+                     Konnect did not modify the schematic.",
+                    target.display(),
+                    reason
+                ),
+            ),
         }
     }
 }
@@ -1557,6 +1584,7 @@ pub(crate) fn sheet_instance_context(
     let standalone = SheetInstanceContext {
         project_name: project_name_for(sch_path),
         instance_path: format!("/{own_root}"),
+        instance_paths: vec![format!("/{own_root}")],
         is_child_sheet: false,
     };
 
@@ -1576,8 +1604,67 @@ pub(crate) fn sheet_instance_context(
             .unwrap_or_default()
             .to_string(),
         instance_path,
+        instance_paths: ownership.instance_paths,
         is_child_sheet: !same_schematic_document(&ownership.root_schematic, sch_path),
     })
+}
+
+/// Prove that every existing placed symbol is keyed to exactly the hierarchy
+/// identities observed from the parsed project root.
+///
+/// A missing, foreign, duplicate, or obsolete path means the file's saved
+/// instance metadata is stale. Adding another symbol in that state would
+/// produce a document where KiCad resolves different components against
+/// different hierarchy instances, so mutation fails closed before the in-memory
+/// schematic is changed.
+pub(crate) fn validate_sheet_instance_state(
+    sch_path: &std::path::Path,
+    schematic: &konnect_schematic_editor::Schematic,
+    context: &SheetInstanceContext,
+) -> Result<(), SchematicTargetError> {
+    let mut expected = context
+        .instance_paths
+        .iter()
+        .map(|path| (context.project_name.clone(), path.clone()))
+        .collect::<Vec<_>>();
+    expected.sort();
+
+    let mut stale_symbols = Vec::new();
+    for symbol in &schematic.symbols {
+        let mut observed = symbol.instance_paths();
+        observed.sort();
+        if observed != expected {
+            let identity = symbol
+                .reference()
+                .filter(|reference| !reference.is_empty())
+                .unwrap_or(symbol.uuid.as_str());
+            let format_paths = |paths: &[(String, String)]| {
+                paths
+                    .iter()
+                    .map(|(project, path)| format!("{project}:{path}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            stale_symbols.push(format!(
+                "{identity} observed [{}], expected [{}]",
+                format_paths(&observed),
+                format_paths(&expected)
+            ));
+        }
+    }
+
+    if stale_symbols.is_empty() {
+        Ok(())
+    } else {
+        Err(SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!(
+                "placed-symbol instance metadata disagrees with project '{}': {}",
+                context.project_name,
+                stale_symbols.join("; ")
+            ),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1703,7 +1790,9 @@ mod schematic_target_tests {
         let child = blank(&nested.join("child.kicad_sch"));
 
         let error = resolve_schematic_ownership(&child).unwrap_err();
-        let SchematicTargetError::AmbiguousProject { target, roots } = error;
+        let SchematicTargetError::AmbiguousProject { target, roots } = error else {
+            panic!("expected ambiguous project error")
+        };
         assert_eq!(target, child);
         assert_eq!(roots.len(), 2);
         let result = SchematicTargetError::AmbiguousProject { target, roots }.into_tool_result();

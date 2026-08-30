@@ -57,6 +57,9 @@ pub enum ToolErrorKind {
         target: String,
         candidates: Vec<String>,
     },
+    /// The caller named a target, but its observed editor or document state
+    /// no longer agrees with the state required to mutate it safely.
+    StaleTarget { target: String, reason: String },
     /// A board was live earlier in this server process, but IPC is now gone;
     /// its saved file may be stale relative to lost editor state.
     UnsafeFileFallback { path: String },
@@ -77,6 +80,7 @@ impl ToolErrorKind {
             Self::FileNotFound { .. } => "file_not_found",
             Self::Conflict { .. } => "conflict",
             Self::AmbiguousTarget { .. } => "ambiguous_target",
+            Self::StaleTarget { .. } => "stale_target",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::HandlerError { .. } => "handler_error",
         }
@@ -180,6 +184,10 @@ mod tests {
             ToolErrorKind::AmbiguousTarget {
                 target: "p".into(),
                 candidates: vec!["a".into(), "b".into()],
+            },
+            ToolErrorKind::StaleTarget {
+                target: "p".into(),
+                reason: "r".into(),
             },
             ToolErrorKind::UnsafeFileFallback { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },
