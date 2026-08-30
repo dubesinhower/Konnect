@@ -202,9 +202,13 @@ fn installation_info_reports_the_serving_process_without_leaking_endpoint_secret
     let body = McpProcess::tool_body(&result);
 
     assert_eq!(body["build"]["version"], env!("CARGO_PKG_VERSION"));
-    let commit = body["build"]["commit"].as_str().unwrap();
-    assert!((7..=64).contains(&commit.len()));
-    assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if let Some(commit) = body["build"]["commit"].as_str() {
+        assert!((7..=64).contains(&commit.len()));
+        assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(body["build"]["commit_source"].is_string());
+    } else {
+        assert!(body["build"]["commit_source"].is_null());
+    }
     assert!(body["runtime"]["executable_path"].is_string());
     assert_eq!(body["installation"]["binary_on_disk"]["probe_status"], "ok");
     assert_eq!(
