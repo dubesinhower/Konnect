@@ -219,11 +219,19 @@ fn editor_state_observation_keeps_live_sheet_identity_and_unsupported_context_ho
         schematic.capabilities.observe_active_context.availability,
         konnect_ipc::IpcCapabilityAvailability::Unsupported
     );
+    assert_eq!(
+        schematic.capabilities.cross_probe.availability,
+        konnect_ipc::IpcCapabilityAvailability::Available
+    );
 
     let pcb = &state.editors[1];
     assert_eq!(pcb.editor, konnect_ipc::IpcEditorKind::Pcb);
     assert!(!pcb.addressable);
     assert!(pcb.documents.is_empty());
+    assert_eq!(
+        pcb.capabilities.cross_probe.availability,
+        konnect_ipc::IpcCapabilityAvailability::Unsupported
+    );
     assert!(pcb
         .unavailable_reason
         .as_deref()

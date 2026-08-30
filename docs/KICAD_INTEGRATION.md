@@ -88,6 +88,17 @@ context readback, so these requests return `unsupported_capability` and send no
 `RunAction`. A future adapter must be version-gated and add result-derived
 active-context readback before any of these operations can report success.
 
+Component cross-probing uses the stable schematic symbol path stored on a PCB
+footprint. A caller supplies both saved documents, the exact schematic instance
+path, source editor, and source KIID. Konnect resolves the source through the
+normal target resolver, requires exactly one destination with a matching path
+and reference, resolves that destination by KIID, and separately proves both
+live document contexts. Missing paths, duplicate footprints, reference drift,
+wrong instances, and closed documents fail explicitly. Because activation is
+unsupported on the bundled KiCad 10 protocol, the resolve-only operation does
+not select or activate either editor. Pin/pad/net expansion remains unsupported
+until a unique stable destination relationship can be modeled.
+
 ## Schematic-To-Board Sync
 
 `update_pcb_from_schematic` in `tools/pcb_sync.rs` is live-IPC-only. It uses
