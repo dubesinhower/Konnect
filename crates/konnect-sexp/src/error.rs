@@ -22,7 +22,8 @@ pub enum SexpError {
     #[error("write conflict: {path} changed since it was read")]
     Conflict { path: PathBuf },
 
-    /// KiCad owns, or may still own, the schematic through its sibling lock.
+    /// KiCad owns, or may still own, the design document through its sibling
+    /// lock.
     ///
     /// KiCad lock files identify only a username and hostname, so their
     /// presence cannot be distinguished reliably from a stale lock. Writers

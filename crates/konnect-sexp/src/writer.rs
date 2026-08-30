@@ -110,7 +110,7 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
 }
 
 pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
-    ensure_kicad_schematic_is_closed(path)?;
+    ensure_kicad_design_document_is_closed(path)?;
     let (tmp_path, mut file) = create_scratch_file(path)?;
 
     // Remove the scratch file unless the rename below succeeds.
@@ -127,7 +127,7 @@ pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), Se
 
     // A lock may have appeared while the scratch file was being written.
     // Recheck at the last refusal point before replacing the document.
-    ensure_kicad_schematic_is_closed(path)?;
+    ensure_kicad_design_document_is_closed(path)?;
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
     sync_parent_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
@@ -205,15 +205,16 @@ pub(crate) fn open_document_lock(path: &Path) -> Result<std::fs::File, SexpError
     open_lock_file(&lock_path)
 }
 
-/// Refuse a `.kicad_sch` mutation while KiCad's sibling lock is present.
+/// Refuse a `.kicad_sch` or `.kicad_pcb` mutation while KiCad's sibling lock
+/// is present.
 ///
 /// KiCad 10 writes only `username` and `hostname` into this file. There is no
 /// PID, process start time, or document token with which to prove that a lock
 /// is stale, especially for another host. Its contents are therefore neither
 /// parsed nor trusted: any filesystem entry at the lock path blocks the write.
-/// Reads and non-schematic writes are unaffected.
-pub(crate) fn ensure_kicad_schematic_is_closed(path: &Path) -> Result<(), SexpError> {
-    let Some(lock_path) = kicad_schematic_lock_path(path) else {
+/// Reads and non-design-document writes are unaffected.
+pub(crate) fn ensure_kicad_design_document_is_closed(path: &Path) -> Result<(), SexpError> {
+    let Some(lock_path) = kicad_editor_lock_path(path) else {
         return Ok(());
     };
 
@@ -226,12 +227,21 @@ pub(crate) fn ensure_kicad_schematic_is_closed(path: &Path) -> Result<(), SexpEr
     }
 }
 
-fn kicad_schematic_lock_path(path: &Path) -> Option<PathBuf> {
-    let is_schematic = path
+/// KiCad's sibling editor-lock path for a schematic or board document:
+/// `~<filename>.lck` in the same directory.
+///
+/// This derives identity only; callers decide what an observed or unreadable
+/// lock means for their operation. Other file types return `None` so a caller
+/// cannot accidentally treat an unrelated tilde file as editor state.
+pub fn kicad_editor_lock_path(path: &Path) -> Option<PathBuf> {
+    let is_design_document = path
         .extension()
         .and_then(OsStr::to_str)
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_sch"));
-    if !is_schematic {
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("kicad_sch")
+                || extension.eq_ignore_ascii_case("kicad_pcb")
+        });
+    if !is_design_document {
         return None;
     }
     let mut name = OsString::from("~");
@@ -359,7 +369,7 @@ pub fn write_new_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
 }
 
 pub(crate) fn write_new_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
-    ensure_kicad_schematic_is_closed(path)?;
+    ensure_kicad_design_document_is_closed(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::Builder::new()
         .prefix(".konnect-")
@@ -367,7 +377,7 @@ pub(crate) fn write_new_atomic_unlocked(path: &Path, content: &str) -> Result<()
     temporary.write_all(content.as_bytes())?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
-    ensure_kicad_schematic_is_closed(path)?;
+    ensure_kicad_design_document_is_closed(path)?;
     temporary
         .persist_noclobber(path)
         .map_err(|error| SexpError::Io(error.error))?;
@@ -1241,6 +1251,22 @@ mod atomic_write_tests {
     }
 
     #[test]
+    fn kicad_editor_lock_path_is_exact_for_schematics_and_boards() {
+        assert_eq!(
+            kicad_editor_lock_path(Path::new("project/design.kicad_sch")),
+            Some(PathBuf::from("project/~design.kicad_sch.lck"))
+        );
+        assert_eq!(
+            kicad_editor_lock_path(Path::new("project/design.kicad_pcb")),
+            Some(PathBuf::from("project/~design.kicad_pcb.lck"))
+        );
+        assert_eq!(
+            kicad_editor_lock_path(Path::new("project/design.kicad_pro")),
+            None
+        );
+    }
+
+    #[test]
     fn conditional_write_rejects_a_kicad_schematic_lock() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("design.kicad_sch");
@@ -1300,16 +1326,23 @@ mod atomic_write_tests {
     }
 
     #[test]
-    fn kicad_lock_name_does_not_block_a_non_schematic_write() {
+    fn conditional_write_rejects_a_kicad_board_lock() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("design.kicad_pcb");
         let lock = directory.path().join("~design.kicad_pcb.lck");
         std::fs::write(&path, "expected").unwrap();
-        std::fs::write(lock, "not relevant to this shared writer").unwrap();
+        std::fs::write(&lock, "editor state cannot be proven stale").unwrap();
 
-        write_atomic_if_unchanged(&path, "expected", "edited").unwrap();
+        let error = write_atomic_if_unchanged(&path, "expected", "edited").unwrap_err();
 
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "edited");
+        assert!(matches!(
+            error,
+            SexpError::KiCadEditorLocked {
+                path: blocked_path,
+                lock_path
+            } if blocked_path == path && lock_path == lock
+        ));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "expected");
     }
 
     #[test]

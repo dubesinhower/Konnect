@@ -308,22 +308,40 @@ impl McpHandler {
                     )
                 }
                 Err(e) if kicad_editor_locked_path(&e).is_some() => {
-                    let path = kicad_editor_locked_path(&e)
-                        .expect("guard matched")
-                        .display()
-                        .to_string();
-                    (
-                        CallToolResult::error_kind(
-                            ToolErrorKind::Conflict {
-                                paths: vec![path.clone()],
-                            },
-                            format!(
-                                "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
+                    let locked = kicad_editor_locked_path(&e).expect("guard matched");
+                    let path = locked.display().to_string();
+                    if locked
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pcb"))
+                    {
+                        let reason = "a KiCad board editor lock appeared before the committed write; saved-file authority cannot be proven".to_string();
+                        (
+                            CallToolResult::error_kind(
+                                ToolErrorKind::StaleTarget {
+                                    target: path.clone(),
+                                    reason: reason.clone(),
+                                },
+                                format!(
+                                    "Board '{path}' has a KiCad editor lock: {reason}. Close or recover Pcbnew, save the authoritative state, and retry only after the lock is gone."
+                                ),
                             ),
-                        ),
-                        CallStatus::Error,
-                        Some("conflict".to_string()),
-                    )
+                            CallStatus::Error,
+                            Some("stale_target".to_string()),
+                        )
+                    } else {
+                        (
+                            CallToolResult::error_kind(
+                                ToolErrorKind::Conflict {
+                                    paths: vec![path.clone()],
+                                },
+                                format!(
+                                    "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
+                                ),
+                            ),
+                            CallStatus::Error,
+                            Some("conflict".to_string()),
+                        )
+                    }
                 }
                 Err(e) => {
                     warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
