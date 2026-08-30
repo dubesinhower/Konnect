@@ -3502,7 +3502,9 @@ fn editor_capabilities(
         mutate_selection: selection,
         activate_document: no_activation.clone(),
         activate_sheet: no_activation,
-        reveal_object: no_reveal,
+        reveal_object: no_reveal.clone(),
+        center_object: no_reveal.clone(),
+        fit_view: no_reveal,
         cross_probe: no_cross_probe,
     }
 }

@@ -79,6 +79,15 @@ entire observed set with the expected before/after transition, and returns a
 structured `readback_mismatch` if KiCad did not make precisely that change.
 Duplicate or empty KIID requests are rejected before IPC.
 
+Exact activation and viewport requests are exposed as semantic operations, not
+action strings. Konnect first proves the requested live project/document/sheet
+and, for reveal or center, resolves the saved object KIID. It then consults the
+running-version capability record. The bundled KiCad 10 protocol has no stable
+typed document/sheet activation, reveal, center, or fit command and no active-
+context readback, so these requests return `unsupported_capability` and send no
+`RunAction`. A future adapter must be version-gated and add result-derived
+active-context readback before any of these operations can report success.
+
 ## Schematic-To-Board Sync
 
 `update_pcb_from_schematic` in `tools/pcb_sync.rs` is live-IPC-only. It uses

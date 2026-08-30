@@ -9,8 +9,9 @@ use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{invalid_arg, opt_str, require_array, require_str, ToolContext, ToolDef};
 use konnect_ipc::{
-    IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionMutation,
-    IpcSelectionMutationErrorKind, IpcSelectionObservationErrorKind, IpcSheetInstancePath,
+    IpcCapabilityAvailability, IpcEditorDocument, IpcEditorKind, IpcProjectIdentity,
+    IpcSelectionMutation, IpcSelectionMutationErrorKind, IpcSelectionObservationErrorKind,
+    IpcSheetInstancePath,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -89,6 +90,25 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["operation", "editor", "project_name", "project_path", "document_path", "object_kiids"]
             }),
             |args, ctx| async move { handle_mutate_editor_selection(args, ctx).await }
+        ),
+        tool!(
+            "activate_editor_context",
+            "Semantically request exact document/sheet activation, object reveal/centering, or view fitting. The operation is capability-gated and returns a typed unsupported result when the running KiCad protocol cannot perform and read back the requested behavior; no raw action is exposed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "operation": { "type": "string", "enum": ["activate", "reveal", "center", "fit"] },
+                    "editor": { "type": "string", "enum": ["schematic", "pcb"] },
+                    "project_name": { "type": "string" },
+                    "project_path": { "type": "string" },
+                    "document_path": { "type": "string", "description": "Exact saved .kicad_sch or .kicad_pcb document" },
+                    "sheet_instance_path": { "type": "array", "items": { "type": "string" } },
+                    "sheet_path_human_readable": { "type": "string" },
+                    "object_kiid": { "type": "string", "description": "Required only for reveal or center" }
+                },
+                "required": ["operation", "editor", "project_name", "project_path", "document_path"]
+            }),
+            |args, ctx| async move { handle_activate_editor_context(args, ctx).await }
         ),
     ]
 }
@@ -687,6 +707,211 @@ fn selection_mutation_error_result(error: anyhow::Error) -> CallToolResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorActivationOperation {
+    Activate,
+    Reveal,
+    Center,
+    Fit,
+}
+
+#[derive(Debug)]
+struct EditorActivationRequest {
+    operation: EditorActivationOperation,
+    live_document: IpcEditorDocument,
+    structural_target: Option<NavigationTargetRequest>,
+}
+
+async fn handle_activate_editor_context(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let request = match parse_editor_activation_request(args) {
+        Ok(request) => request,
+        Err(result) => return Ok(result),
+    };
+    let address = ctx.config.ipc_address.clone();
+    if address.is_empty() {
+        return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
+    }
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let resolved_target = request
+            .structural_target
+            .as_ref()
+            .map(resolve_navigation_target)
+            .transpose()?;
+        let client = konnect_ipc::KiCadIpcClient::new(address);
+        let live_document = client.observe_exact_open_document(&request.live_document)?;
+        let state = client.observe_editor_state()?;
+        Ok((request.operation, live_document, resolved_target, state))
+    })
+    .await?;
+    let (operation, live_document, _resolved_target, state) = match result {
+        Ok(result) => result,
+        Err(error) => return Ok(selection_mutation_error_result(error)),
+    };
+    let editor = state
+        .editors
+        .iter()
+        .find(|observed| observed.editor == live_document.editor);
+    let capability_name = activation_capability_name(operation, live_document.editor);
+    let capability = editor.map(|observed| match operation {
+        EditorActivationOperation::Activate => match live_document.editor {
+            IpcEditorKind::Schematic => &observed.capabilities.activate_sheet,
+            IpcEditorKind::Pcb => &observed.capabilities.activate_document,
+        },
+        EditorActivationOperation::Reveal => &observed.capabilities.reveal_object,
+        EditorActivationOperation::Center => &observed.capabilities.center_object,
+        EditorActivationOperation::Fit => &observed.capabilities.fit_view,
+    });
+    let reason = capability
+        .and_then(|capability| capability.reason.as_deref())
+        .unwrap_or("the bundled semantic adapter cannot perform and read back this operation");
+    if capability.is_none()
+        || capability.is_some_and(|capability| {
+            capability.availability != IpcCapabilityAvailability::Available
+        })
+    {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::UnsupportedCapability {
+                capability: capability_name.to_string(),
+                kicad_version: Some(state.kicad_version.full_version),
+            },
+            format!(
+                "KiCad cannot safely perform {capability_name} for the exact requested context: {reason}."
+            ),
+        ));
+    }
+
+    // A future protocol may advertise support before Konnect has a semantic
+    // adapter with active-context readback. That still is not permission to
+    // expose or send an unstable action.
+    Ok(CallToolResult::error_kind(
+        ToolErrorKind::UnsupportedCapability {
+            capability: capability_name.to_string(),
+            kicad_version: Some(state.kicad_version.full_version),
+        },
+        format!(
+            "KiCad advertises {capability_name}, but Konnect has no version-gated semantic adapter with active-context readback."
+        ),
+    ))
+}
+
+fn activation_capability_name(
+    operation: EditorActivationOperation,
+    editor: IpcEditorKind,
+) -> &'static str {
+    match operation {
+        EditorActivationOperation::Activate if editor == IpcEditorKind::Schematic => {
+            "activate_sheet"
+        }
+        EditorActivationOperation::Activate => "activate_document",
+        EditorActivationOperation::Reveal => "reveal_object",
+        EditorActivationOperation::Center => "center_object",
+        EditorActivationOperation::Fit => "fit_view",
+    }
+}
+
+fn parse_editor_activation_request(
+    args: &serde_json::Value,
+) -> Result<EditorActivationRequest, CallToolResult> {
+    let operation = match require_str(args, "operation")? {
+        "activate" => EditorActivationOperation::Activate,
+        "reveal" => EditorActivationOperation::Reveal,
+        "center" => EditorActivationOperation::Center,
+        "fit" => EditorActivationOperation::Fit,
+        _ => {
+            return Err(invalid_arg(
+                "operation",
+                "expected 'activate', 'reveal', 'center', or 'fit'",
+            ))
+        }
+    };
+    let editor = match require_str(args, "editor")? {
+        "schematic" => IpcEditorKind::Schematic,
+        "pcb" => IpcEditorKind::Pcb,
+        _ => return Err(invalid_arg("editor", "expected 'schematic' or 'pcb'")),
+    };
+    let project_name = require_str(args, "project_name")?;
+    let project_path = require_str(args, "project_path")?;
+    let document_path = require_str(args, "document_path")?;
+    if project_name.is_empty() || project_path.is_empty() || document_path.is_empty() {
+        return Err(invalid_arg(
+            "project_name",
+            "project and document identity strings must not be empty",
+        ));
+    }
+    let project = IpcProjectIdentity {
+        name: project_name.to_string(),
+        path: project_path.to_string(),
+    };
+    let sheet_instance_path = match editor {
+        IpcEditorKind::Pcb => {
+            if !args["sheet_instance_path"].is_null()
+                || !args["sheet_path_human_readable"].is_null()
+            {
+                return Err(invalid_arg(
+                    "sheet_instance_path",
+                    "PCB targets cannot carry schematic sheet identity",
+                ));
+            }
+            None
+        }
+        IpcEditorKind::Schematic => {
+            let ids = require_array(args, "sheet_instance_path")?
+                .iter()
+                .map(|value| value.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    invalid_arg("sheet_instance_path", "every entry must be a string")
+                })?;
+            if ids.is_empty() || ids.iter().any(String::is_empty) {
+                return Err(invalid_arg(
+                    "sheet_instance_path",
+                    "must contain non-empty root-to-leaf KIIIDs",
+                ));
+            }
+            Some(IpcSheetInstancePath {
+                kiids: ids,
+                human_readable: opt_str(args, "sheet_path_human_readable")
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        }
+    };
+    let object_kiid = opt_str(args, "object_kiid").map(str::to_string);
+    let needs_object = matches!(
+        operation,
+        EditorActivationOperation::Reveal | EditorActivationOperation::Center
+    );
+    if object_kiid.as_deref().is_some_and(str::is_empty) || needs_object != object_kiid.is_some() {
+        return Err(invalid_arg(
+            "object_kiid",
+            "reveal/center require one non-empty KIID; activate/fit do not accept one",
+        ));
+    }
+    let saved_document = PathBuf::from(document_path);
+    let structural_target = object_kiid.map(|kiid| NavigationTargetRequest {
+        editor,
+        project: project.clone(),
+        document_path: saved_document.clone(),
+        sheet_instance_path: sheet_instance_path.clone(),
+        object_kiid: Some(kiid),
+        human_reference: None,
+    });
+    Ok(EditorActivationRequest {
+        operation,
+        live_document: IpcEditorDocument {
+            editor,
+            project: Some(project),
+            document_path: (editor == IpcEditorKind::Pcb)
+                .then(|| saved_document.display().to_string()),
+            sheet_instance_path,
+        },
+        structural_target,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,7 +923,7 @@ mod tests {
     use konnect_ipc::gen::kiapi;
     use nng::options::Options;
     use prost::Message;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     fn context(ipc_address: String) -> ToolContext {
@@ -956,10 +1181,85 @@ mod tests {
         url
     }
 
+    fn spawn_activation_capability_mock(
+        project_path: String,
+        commands: Arc<Mutex<Vec<String>>>,
+    ) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let url = format!(
+            "inproc://activation-capability-core-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
+        socket.listen(&url).expect("listen");
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let message = socket.recv().expect("request");
+                let request =
+                    kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
+                let command = request.message.expect("command");
+                commands.lock().unwrap().push(command.type_url.clone());
+                let mut response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: None,
+                };
+                if command.type_url.ends_with("GetVersion") {
+                    response.message = Some(builders::pack_any(
+                        &kiapi::common::commands::GetVersionResponse {
+                            version: Some(kiapi::common::types::KiCadVersion {
+                                major: 10,
+                                minor: 0,
+                                patch: 5,
+                                full_version: "10.0.5".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.GetVersionResponse",
+                    ));
+                } else {
+                    let query =
+                        kiapi::common::commands::GetOpenDocuments::decode(command.value.as_slice())
+                            .expect("open documents query");
+                    if query.r#type == kiapi::common::types::DocumentType::DoctypeSchematic as i32 {
+                        response.status = Some(kiapi::common::ApiResponseStatus {
+                            status: kiapi::common::ApiStatusCode::AsUnhandled as i32,
+                            error_message: "schematic endpoint unavailable".to_string(),
+                        });
+                    } else {
+                        response.message = Some(builders::pack_any(
+                            &kiapi::common::commands::GetOpenDocumentsResponse {
+                                documents: vec![kiapi::common::types::DocumentSpecifier {
+                                    r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                                    identifier: Some(
+                                        kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                            "layout.kicad_pcb".to_string(),
+                                        ),
+                                    ),
+                                    project: Some(kiapi::common::types::ProjectSpecifier {
+                                        name: "nav".to_string(),
+                                        path: project_path.clone(),
+                                    }),
+                                }],
+                            },
+                            "kiapi.common.commands.GetOpenDocumentsResponse",
+                        ));
+                    }
+                }
+                socket
+                    .send(nng::Message::from(response.encode_to_vec().as_slice()))
+                    .expect("response");
+            }
+        });
+        url
+    }
+
     #[test]
     fn public_tool_is_read_only_and_takes_no_required_arguments() {
         let definitions = tools();
-        assert_eq!(definitions.len(), 4);
+        assert_eq!(definitions.len(), 5);
         let state = definitions
             .iter()
             .find(|tool| tool.name == "get_editor_state")
@@ -994,6 +1294,20 @@ mod tests {
                 "project_path",
                 "document_path",
                 "object_kiids"
+            ])
+        );
+        let activation = definitions
+            .iter()
+            .find(|tool| tool.name == "activate_editor_context")
+            .expect("activation tool");
+        assert_eq!(
+            activation.input_schema["required"],
+            json!([
+                "operation",
+                "editor",
+                "project_name",
+                "project_path",
+                "document_path"
             ])
         );
     }
@@ -1274,5 +1588,93 @@ mod tests {
             extract_error_kind(&result).as_deref(),
             Some("unsupported_capability")
         );
+    }
+
+    #[test]
+    fn activation_parser_requires_object_identity_only_for_object_operations() {
+        let base = json!({
+            "operation": "activate",
+            "editor": "pcb",
+            "project_name": "navigation",
+            "project_path": r"C:\design",
+            "document_path": r"C:\design\navigation.kicad_pcb"
+        });
+        assert!(parse_editor_activation_request(&base).is_ok());
+        let mut invalid = base.clone();
+        invalid["operation"] = json!("reveal");
+        let error = parse_editor_activation_request(&invalid).expect_err("reveal needs KIID");
+        assert_eq!(
+            extract_error_kind(&error).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(
+            activation_capability_name(
+                EditorActivationOperation::Activate,
+                IpcEditorKind::Schematic
+            ),
+            "activate_sheet"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_activation_is_typed_unsupported_and_sends_no_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("layout.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        let project_path = temp.path().display().to_string();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let result = handle_activate_editor_context(
+            &json!({
+                "operation": "activate",
+                "editor": "pcb",
+                "project_name": "nav",
+                "project_path": project_path.clone(),
+                "document_path": board.display().to_string()
+            }),
+            &context(spawn_activation_capability_mock(
+                project_path,
+                commands.clone(),
+            )),
+        )
+        .await
+        .expect("handler result");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("unsupported_capability")
+        );
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["capability"], "activate_document");
+        assert_eq!(body["error"]["kicad_version"], "10.0.5");
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands.len(), 4);
+        assert!(commands.iter().all(|command| {
+            command.ends_with("GetVersion") || command.ends_with("GetOpenDocuments")
+        }));
+        assert!(!commands.iter().any(|command| command.contains("RunAction")));
+    }
+
+    #[tokio::test]
+    async fn stale_reveal_object_is_refused_before_any_live_action() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("nav.kicad_pro"), "{}").unwrap();
+        let board = temp.path().join("layout.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        let result = handle_activate_editor_context(
+            &json!({
+                "operation": "reveal",
+                "editor": "pcb",
+                "project_name": "nav",
+                "project_path": temp.path().display().to_string(),
+                "document_path": board.display().to_string(),
+                "object_kiid": "gone"
+            }),
+            &context("inproc://must-not-be-contacted".to_string()),
+        )
+        .await
+        .expect("handler result");
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
     }
 }
