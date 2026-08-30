@@ -3,6 +3,30 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: complete schematic placement instances (minor release)
+
+`add_schematic_component`, `batch_place_components`, and `add_power_symbol`
+preserve every instance path when the saved root reuses a child schematic.
+Existing inputs and response fields remain. Placement results now include
+`schematic`, `project`, `instance_paths`, and observed symbol fields (`uuid`,
+`added`, `reference`, `value`, `x`, `y`, `rotation`, `unit`). Batch results put
+these fields in each `placed` entry; power placement retains `added_power` and
+`junctions_added`. Values come from reloading the committed file.
+
+Missing, foreign, duplicate, malformed, or obsolete saved instance paths,
+references, or units return `stale_target` with `target` and `reason` before
+placement writes. Repair the saved hierarchy and its complete symbol instance
+metadata before retrying. Ambiguous
+project ownership continues to use the existing `conflict` kind from #189.
+If post-write readback cannot verify the target or symbol, `stale_target` may
+follow a committed write: inspect/reload the file before retrying to avoid a
+duplicate placement. This observes saved files only and does not claim an
+atomic snapshot of the complete hierarchy or unsaved editor state.
+
+See [Schematic project ownership](PROJECT_OWNERSHIP.md#placement-instance-validation)
+for the acceptance matrix and limits. This additive response change is planned
+for the next minor release; no tool or argument was renamed or removed.
+
 ## Unreleased: schematic ownership conflicts (minor release)
 
 Symbol-loading operations and ERC root detection now refuse unproven or ambiguous

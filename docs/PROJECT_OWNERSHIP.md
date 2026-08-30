@@ -29,6 +29,29 @@ placement does so once before processing any entries, so ownership conflicts
 cannot leave partially placed components. A local library table establishes
 library authority, not proof of hierarchy membership for placement metadata.
 
+## Placement instance validation
+
+Single component, batch component, and power-symbol placement share the same
+saved hierarchy context. A document-wide placement into a reused child writes
+every observed project/path entry, then reloads the committed target and derives
+the successful response from that symbol.
+
+| Observed saved state | Placement result |
+| --- | --- |
+| Unique child with matching saved symbol metadata | Write its exact hierarchy path. |
+| Reused child with matching metadata | Write every hierarchy path; preserve existing symbols and other documents. |
+| Loose schematic with no candidate project and matching local instance metadata | Use its own project name and root UUID. |
+| Missing, foreign, duplicate, malformed, or obsolete symbol paths, references, or units | Return `stale_target` before writing; never silently repair or pick one entry. References must retain the symbol's designator identity, at least one hierarchy entry must match the symbol Reference, and every saved unit must match the placed unit. |
+| Unproven or ambiguous project ownership | Preserve #189's `conflict` refusal before writing. |
+| Readback has the wrong document, missing symbol/fields, or inconsistent instance metadata | Return `stale_target` instead of success; the placement may already have been written. |
+
+The saved root sheet tree supplies expected paths. Existing symbol instance
+entries supply preflight evidence. Reloaded symbol fields supply the UUID,
+library identity, reference, value, coordinates, rotation, unit, project and
+paths in the response. Correct the root links and saved symbol metadata together
+before retrying a stale preflight. After a readback failure, inspect the file
+first to avoid adding the same symbol twice.
+
 ## Unreleased notes (next minor release)
 
 Schematics that previously inherited an unrelated ancestor project's libraries,
@@ -36,7 +59,12 @@ or silently fell back to projectless operation despite an unproven candidate,
 now return `conflict`. Repair the saved root-to-child sheet references, restore
 unreadable project schematics, or place a genuinely independent document outside
 the unrelated project. An explicit library table beside a schematic continues
-to select its library context. No tool, argument, or new error kind is added.
+to select its library context. Ownership uses the existing `conflict` kind.
+
+Placement adds `stale_target` and observed hierarchy/readback fields without
+removing existing tools, inputs, or response fields. These response changes are
+also part of the next minor release (#383/#389); see
+[API migrations](API_MIGRATIONS.md#unreleased-complete-schematic-placement-instances-minor-release).
 
 This behavior change belongs in the next minor release, as agreed in #189.
 Existing `conflict` clients should inspect `error.paths` and the message before
@@ -50,8 +78,11 @@ directories, unrelated candidates, and explicit corruptions of temporary copies.
 
 Resolution observes saved files, not unsaved editor state. Traversal is
 cycle-safe and bounded by `MAX_HIERARCHY_DEPTH`; it does not establish ownership
-through an untraversable hierarchy. This change does not implement the later
-all-placement-instances work in #389 or live-editor navigation.
+through an untraversable hierarchy. Placement tests use this same KiCad-authored
+fixture for unique/reused children, real multi-unit symbols, all three placement
+handlers, stale path/reference/unit and ambiguous no-write refusals, and
+committed-file readback.
+This does not implement live-editor navigation.
 
 Ownership evidence is read during preflight; it is not an atomic snapshot of
 every project file. Target-file writes retain their existing revision checks.
