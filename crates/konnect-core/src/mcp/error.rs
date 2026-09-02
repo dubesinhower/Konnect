@@ -47,9 +47,10 @@ pub enum ToolErrorKind {
     UnknownTool { tool: String },
     /// A required argument is missing or malformed.
     InvalidArgument { field: String, reason: String },
-    /// A referenced file doesn't exist or can't be read.
+    /// A referenced file or discovery directory doesn't exist or can't be read.
     FileNotFound { path: String },
-    /// A mutation would replace one or more existing filesystem targets.
+    /// A mutation conflicts with filesystem state, or schematic ownership
+    /// cannot be proven uniquely. Paths identify the conflicting evidence.
     Conflict { paths: Vec<String> },
     /// A board was live earlier in this server process, but IPC is now gone;
     /// its saved file may be stale relative to lost editor state.
