@@ -151,10 +151,7 @@ pub async fn handle_meta_tool(
         "get_active_toolsets" => Some(handle_get_active_toolsets(ctx).await),
         "get_recent_calls" => Some(handle_get_recent_calls(args, ctx).await),
         "server_stats" => Some(handle_server_stats(ctx).await),
-        "get_installation_info" => {
-            let info = crate::runtime_info::collect(&ctx.config).await;
-            Some(CallToolResult::json(&info))
-        }
+        "get_installation_info" => Some(handle_get_installation_info(ctx).await),
         _ => None,
     }
 }
@@ -310,6 +307,11 @@ async fn handle_get_recent_calls(
 async fn handle_server_stats(ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
     let snap = ctx.observer.snapshot().await;
     CallToolResult::json(&snap)
+}
+
+async fn handle_get_installation_info(ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
+    let info = crate::runtime_info::collect(&ctx.config).await;
+    CallToolResult::json(&info)
 }
 
 async fn handle_get_active_toolsets(ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
