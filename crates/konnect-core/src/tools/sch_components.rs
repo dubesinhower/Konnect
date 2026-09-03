@@ -542,9 +542,16 @@ async fn handle_add_schematic_component(
     // whose path doesn't resolve. On a child sheet both differ from this
     // file's own stem and uuid, which is what left hierarchical designs
     // unannotated (#204).
-    let context = crate::tools::sheet_instance_context(&sch_path, &mut sch);
+    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
+        Ok(context) => context,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
     let instance_path = context.instance_path.clone();
     let project_name = context.project_name.clone();
+    let source = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
 
     let result = match place_one_component(
         &mut sch,
@@ -557,7 +564,7 @@ async fn handle_add_schematic_component(
         ref_str,
         value,
         unit,
-        &crate::tools::library::KiCadSymbolSource::for_file(&sch_path),
+        &source,
     ) {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -1754,7 +1761,10 @@ async fn handle_update_symbols_from_library(
     let mut unchanged = Vec::new();
     let mut pins_moved = Vec::new();
     let mut errors = Vec::new();
-    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
     let outcomes = reembed_lib_symbols(&mut content, &lib_ids, allow_pin_moves, &src);
     for (lib_id, outcome) in lib_ids.iter().zip(outcomes) {
         match outcome {
@@ -1972,7 +1982,10 @@ async fn handle_replace_component(
         .map(|instance| instance.unit)
         .collect();
 
-    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
     let embedded_unit_count = parsed
         .find("lib_symbols")
         .and_then(|libraries| {
@@ -2305,6 +2318,68 @@ mod tests {
             !written.contains("(path \"/CHILDUUID\""),
             "the child's own uuid must not be the whole path:\n{written}"
         );
+    }
+
+    #[tokio::test]
+    async fn placement_refuses_ambiguous_project_ownership_without_writing() {
+        let outer = tempfile::tempdir().unwrap();
+        let nested = outer.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(outer.path().join("outer.kicad_pro"), "{}").unwrap();
+        std::fs::write(nested.join("inner.kicad_pro"), "{}").unwrap();
+        let root = |root_uuid: &str, sheet_uuid: &str, child: &str| {
+            format!(
+                r#"(kicad_sch
+	(version 20250610)
+	(generator "eeschema")
+	(uuid "{root_uuid}")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 20 20)
+		(size 40 20)
+		(uuid "{sheet_uuid}")
+		(property "Sheetname" "Child" (at 20 19.365 0))
+		(property "Sheetfile" "{child}" (at 20 40.635 0))
+	)
+	(sheet_instances (path "/" (page "1")))
+)
+"#,
+            )
+        };
+        std::fs::write(
+            outer.path().join("outer.kicad_sch"),
+            root("outer-root", "outer-path", "nested/child.kicad_sch"),
+        )
+        .unwrap();
+        std::fs::write(
+            nested.join("inner.kicad_sch"),
+            root("inner-root", "inner-path", "child.kicad_sch"),
+        )
+        .unwrap();
+        let child = nested.join("child.kicad_sch");
+        std::fs::write(&child, crate::tools::blank_schematic_template()).unwrap();
+        let before = std::fs::read(&child).unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": child.display().to_string(),
+                "lib_id": "Device:R",
+                "reference": "R1",
+                "x": 100.0,
+                "y": 100.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("conflict")
+        );
+        assert_eq!(std::fs::read(&child).unwrap(), before);
     }
 
     /// A standalone sheet — no project file, no parent — keeps the old
