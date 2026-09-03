@@ -27,6 +27,8 @@ pub mod sch_export;
 pub mod sch_hierarchy;
 pub mod sch_wiring;
 pub mod schematic_builder;
+#[cfg(test)]
+mod schematic_placement_tests;
 pub mod svg_import;
 pub mod templates;
 pub mod verification;
@@ -1332,6 +1334,10 @@ pub struct SheetInstanceContext {
     pub project_name: String,
     /// `/root-uuid[/sheet-uuid…]`, the path from the root down to this sheet.
     pub instance_path: String,
+    /// Every structurally observed path to this document. A reused child sheet
+    /// has one entry per hierarchy instance; document-wide edits affect all of
+    /// them and must never silently choose the first.
+    pub instance_paths: Vec<String>,
     /// Whether this sheet was reached from a root other than itself.
     pub is_child_sheet: bool,
 }
@@ -1362,6 +1368,10 @@ pub(crate) enum SchematicTargetError {
         target: std::path::PathBuf,
         roots: Vec<std::path::PathBuf>,
     },
+    StaleTarget {
+        target: std::path::PathBuf,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for SchematicTargetError {
@@ -1389,6 +1399,13 @@ impl std::fmt::Display for SchematicTargetError {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::StaleTarget { target, reason } => {
+                write!(
+                    formatter,
+                    "schematic '{}' is stale: {reason}",
+                    target.display()
+                )
+            }
         }
     }
 }
@@ -1414,6 +1431,17 @@ impl SchematicTargetError {
                     message,
                 )
             }
+            Self::StaleTarget { target, reason } => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::StaleTarget {
+                    target: target.display().to_string(),
+                    reason: reason.clone(),
+                },
+                format!(
+                    "Schematic '{}' does not match its structurally observed target state: {}.",
+                    target.display(),
+                    reason
+                ),
+            ),
         }
     }
 }
@@ -1593,6 +1621,7 @@ pub(crate) fn sheet_instance_context(
     let standalone = SheetInstanceContext {
         project_name: project_name_for(sch_path),
         instance_path: format!("/{own_root}"),
+        instance_paths: vec![format!("/{own_root}")],
         is_child_sheet: false,
     };
 
@@ -1612,8 +1641,111 @@ pub(crate) fn sheet_instance_context(
             .unwrap_or_default()
             .to_string(),
         instance_path,
+        instance_paths: ownership.instance_paths,
         is_child_sheet: !same_schematic_document(&ownership.root_schematic, sch_path),
     })
+}
+
+/// Prove that every existing placed symbol is keyed to exactly the hierarchy
+/// identities observed from the parsed project root.
+///
+/// A missing, foreign, duplicate, or obsolete path means the file's saved
+/// instance metadata is stale. Adding another symbol in that state would
+/// produce a document where KiCad resolves different components against
+/// different hierarchy instances, so mutation fails closed before the in-memory
+/// schematic is changed.
+pub(crate) fn validate_sheet_instance_state(
+    sch_path: &std::path::Path,
+    schematic: &konnect_schematic_editor::Schematic,
+    context: &SheetInstanceContext,
+) -> Result<(), SchematicTargetError> {
+    let mut expected = context
+        .instance_paths
+        .iter()
+        .map(|path| (context.project_name.clone(), path.clone()))
+        .collect::<Vec<_>>();
+    expected.sort();
+
+    fn reference_prefix(reference: &str) -> &str {
+        reference.trim_end_matches(|character: char| character.is_ascii_digit() || character == '?')
+    }
+
+    let mut stale_symbols = Vec::new();
+    for symbol in &schematic.symbols {
+        let instances = symbol.instances();
+        let mut observed = instances
+            .iter()
+            .filter_map(|instance| Some((instance.project.clone()?, instance.path.clone()?)))
+            .collect::<Vec<_>>();
+        observed.sort();
+        let symbol_reference = symbol.reference().filter(|reference| !reference.is_empty());
+        let malformed = instances.iter().any(|instance| {
+            instance.project.as_deref().is_none_or(str::is_empty)
+                || instance.path.as_deref().is_none_or(str::is_empty)
+                || instance.reference.as_deref().is_none_or(str::is_empty)
+                || instance.unit.is_none()
+        });
+        let wrong_unit = instances
+            .iter()
+            .any(|instance| instance.unit != Some(symbol.unit));
+        let wrong_reference = symbol_reference.is_none_or(|reference| {
+            let prefix = reference_prefix(reference);
+            !instances
+                .iter()
+                .any(|instance| instance.reference.as_deref() == Some(reference))
+                || instances.iter().any(|instance| {
+                    instance
+                        .reference
+                        .as_deref()
+                        .is_none_or(|candidate| reference_prefix(candidate) != prefix)
+                })
+        });
+        if malformed || observed != expected || wrong_unit || wrong_reference {
+            let identity = symbol_reference.unwrap_or(symbol.uuid.as_str());
+            let format_paths = |paths: &[(String, String)]| {
+                paths
+                    .iter()
+                    .map(|(project, path)| format!("{project}:{path}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut reasons = Vec::new();
+            if malformed {
+                reasons
+                    .push("missing or malformed project/path/reference/unit metadata".to_string());
+            }
+            if observed != expected {
+                reasons.push(format!(
+                    "observed [{}], expected [{}]",
+                    format_paths(&observed),
+                    format_paths(&expected)
+                ));
+            }
+            if wrong_unit {
+                reasons.push(format!(
+                    "instance unit disagrees with symbol unit {}",
+                    symbol.unit
+                ));
+            }
+            if wrong_reference {
+                reasons.push("instance reference identity disagrees with the symbol".to_string());
+            }
+            stale_symbols.push(format!("{identity}: {}", reasons.join(", ")));
+        }
+    }
+
+    if stale_symbols.is_empty() {
+        Ok(())
+    } else {
+        Err(SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!(
+                "placed-symbol instance metadata disagrees with project '{}': {}",
+                context.project_name,
+                stale_symbols.join("; ")
+            ),
+        })
+    }
 }
 
 #[cfg(test)]

@@ -81,7 +81,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_schematic_component",
             "Add a symbol from a KiCAD library to the schematic. The symbol is snapped \
-             to the 1.27mm schematic grid. Specify position in schematic mm coordinates.",
+             to the 1.27mm schematic grid. Preserves every saved hierarchy instance, reports \
+             committed-file readback, and refuses stale instance metadata before writing. \
+             Specify position in schematic mm coordinates.",
             json!({
                 "type": "object",
                 "properties": {
@@ -546,17 +548,18 @@ async fn handle_add_schematic_component(
         Ok(context) => context,
         Err(error) => return Ok(error.into_tool_result()),
     };
-    let instance_path = context.instance_path.clone();
-    let project_name = context.project_name.clone();
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
+        return Ok(error.into_tool_result());
+    }
     let source = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
         Ok(source) => source,
         Err(error) => return Ok(error.into_tool_result()),
     };
 
-    let result = match place_one_component(
+    let uuid = match place_one_component(
         &mut sch,
-        &instance_path,
-        &project_name,
+        &context.instance_paths,
+        &context.project_name,
         &lib_id,
         x,
         y,
@@ -566,7 +569,7 @@ async fn handle_add_schematic_component(
         unit,
         &source,
     ) {
-        Ok(v) => v,
+        Ok(uuid) => uuid,
         Err(e) => return Ok(e),
     };
 
@@ -576,8 +579,12 @@ async fn handle_add_schematic_component(
     // KiCad's netlister treats it as unconnected. Runs after the write because
     // it re-reads the saved file; `place_one_component` stays pure so the batch
     // path can do one junction pass for the whole batch instead of one per part.
-    let mut result = result;
     let junctions = crate::tools::add_pin_midwire_junctions(&sch_path, ref_str)?;
+    let committed = cse::Schematic::load(&sch_path)?;
+    let mut result = match placed_component_readback(&sch_path, &committed, &uuid, &context) {
+        Ok(result) => result,
+        Err(error) => return Ok(error),
+    };
     result["junctions_added"] = json!(junctions
         .iter()
         .map(|(x, y)| json!({ "x": x, "y": y }))
@@ -592,7 +599,7 @@ async fn handle_add_schematic_component(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn place_one_component(
     sch: &mut cse::Schematic,
-    instance_path: &str,
+    instance_paths: &[String],
     project_name: &str,
     lib_id: &str,
     x: f64,
@@ -602,7 +609,7 @@ pub(crate) fn place_one_component(
     value: Option<&str>,
     unit: u32,
     src: &dyn cse::library::SymbolLibrarySource,
-) -> Result<serde_json::Value, CallToolResult> {
+) -> Result<String, CallToolResult> {
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
     let val_str = value.unwrap_or(lib_id.split(':').next_back().unwrap_or("?"));
@@ -693,18 +700,88 @@ pub(crate) fn place_one_component(
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
-    sym.set_instance_path(project_name, instance_path, reference, unit);
+    for instance_path in instance_paths {
+        sym.set_instance_path(project_name, instance_path, reference, unit);
+    }
 
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
 
+    Ok(uuid)
+}
+
+/// Build a placement response only from the committed schematic that was read
+/// back after the write. The UUID is the mutation's stable identity; requested
+/// coordinates, fields, and hierarchy paths are never echoed as proof.
+pub(crate) fn placed_component_readback(
+    sch_path: &std::path::Path,
+    committed: &cse::Schematic,
+    uuid: &str,
+    context: &crate::tools::SheetInstanceContext,
+) -> Result<serde_json::Value, CallToolResult> {
+    if !super::same_schematic_document(sch_path, committed.filepath()) {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: "placement readback came from a different schematic".to_string(),
+        }
+        .into_tool_result());
+    }
+    if let Err(error) = crate::tools::validate_sheet_instance_state(sch_path, committed, context) {
+        return Err(error.into_tool_result());
+    }
+    let Some(symbol) = committed.symbols.iter().find(|symbol| symbol.uuid == uuid) else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!("placed symbol UUID '{uuid}' is absent from post-write readback"),
+        }
+        .into_tool_result());
+    };
+    let Some(reference) = symbol.reference() else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!(
+                "placed symbol UUID '{}' has no Reference in post-write readback",
+                symbol.uuid
+            ),
+        }
+        .into_tool_result());
+    };
+    let Some(value) = symbol.value_str() else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!(
+                "placed symbol UUID '{}' has no Value in post-write readback",
+                symbol.uuid
+            ),
+        }
+        .into_tool_result());
+    };
+    let observed_instances = symbol.instance_paths();
+    let Some((project, _)) = observed_instances.first() else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!("placed symbol UUID '{uuid}' has no project in post-write readback"),
+        }
+        .into_tool_result());
+    };
+    let mut instance_paths = observed_instances
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    instance_paths.sort();
+
     Ok(json!({
-        "added": lib_id,
+        "schematic": committed.filepath().display().to_string(),
+        "added": symbol.lib_id,
         "reference": reference,
-        "value": val_str,
-        "x": x, "y": y,
-        "unit": unit,
-        "uuid": uuid
+        "value": value,
+        "x": symbol.at.x,
+        "y": symbol.at.y,
+        "rotation": symbol.at.rotation.unwrap_or(0.0),
+        "unit": symbol.unit,
+        "uuid": symbol.uuid,
+        "project": project,
+        "instance_paths": instance_paths
     }))
 }
 

@@ -8,8 +8,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_str, project_name_for, require_array,
-    require_f64, require_str, ToolDef,
+    find_all_symbol_instance_blocks, get_path, opt_str, require_array, require_f64, require_str,
+    ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -29,7 +29,7 @@ use std::collections::HashSet;
 
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
-use super::sch_components::place_one_component;
+use super::sch_components::{place_one_component, placed_component_readback};
 use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -64,7 +64,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_place_components",
-            "Place multiple symbols from KiCAD libraries in a single file read/write cycle. \
+            "Place multiple symbols from KiCAD libraries in one write with committed-file \
+             readback. Preserves every saved hierarchy instance and preflights stale metadata \
+             before any placement. \
              Pass explicit references -- there is no auto-numbering; an omitted reference \
              becomes '?' like an eeschema-unannotated symbol, same as add_schematic_component.",
             json!({
@@ -479,15 +481,20 @@ async fn handle_batch_place_components(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
-    let project_name = project_name_for(&sch_path);
+    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
+        Ok(context) => context,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
+        return Ok(error.into_tool_result());
+    }
     // Built once: the lib-table parse is memoised across the whole batch.
     let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
         Ok(source) => source,
         Err(error) => return Ok(error.into_tool_result()),
     };
 
-    let mut placed: Vec<serde_json::Value> = Vec::new();
+    let mut placed_uuids = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     for comp in &components {
@@ -506,8 +513,8 @@ async fn handle_batch_place_components(
 
         match place_one_component(
             &mut sch,
-            &root_uuid,
-            &project_name,
+            &context.instance_paths,
+            &context.project_name,
             lib_id,
             x,
             y,
@@ -517,13 +524,21 @@ async fn handle_batch_place_components(
             unit,
             &src,
         ) {
-            Ok(v) => placed.push(v),
+            Ok(uuid) => placed_uuids.push(uuid),
             Err(e) => errors.push(error_text(&e)),
         }
     }
 
-    if !placed.is_empty() {
+    let mut placed = Vec::new();
+    if !placed_uuids.is_empty() {
         sch.overwrite()?;
+        let committed = cse::Schematic::load(&sch_path)?;
+        for uuid in &placed_uuids {
+            match placed_component_readback(&sch_path, &committed, uuid, &context) {
+                Ok(result) => placed.push(result),
+                Err(error) => return Ok(error),
+            }
+        }
     }
 
     let mut result = CallToolResult::json(&json!({
