@@ -3,6 +3,17 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: schematic ownership conflicts (minor release)
+
+Symbol-loading operations and ERC root detection now refuse unproven or ambiguous
+ancestor project ownership with the existing `conflict` kind. Previously, some
+of these cases silently inherited unrelated libraries or treated the schematic
+as projectless. `error.paths` names the schematic directory and every candidate
+root. Restore the saved hierarchy or separate the independent document from the
+unrelated project before retrying. Loose schematics with no candidate project
+and adjacent library-table authority remain supported. See
+[Schematic project ownership](PROJECT_OWNERSHIP.md) for the behavior and limits.
+
 ## Unreleased: Rust Specctra export is the default
 
 `export_specctra_dsn.native_bridge_mode` now defaults to `disable`, so an

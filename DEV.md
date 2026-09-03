@@ -258,8 +258,8 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `toolset_not_loaded` | Tool exists but its toolset isn't loaded yet |
 | `unknown_tool` | Tool name doesn't exist in any toolset |
 | `invalid_argument` | Required argument missing/malformed |
-| `file_not_found` | Referenced file doesn't exist |
-| `conflict` | The file changed after it was read, or a write would replace paths that already exist — carries them |
+| `file_not_found` | Referenced file or project-discovery directory does not exist or cannot be read |
+| `conflict` | The file changed, a write would replace existing paths, or schematic project ownership cannot be proven uniquely — carries the affected paths; ownership conflicts include the schematic directory and all candidate roots |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
 
 ### Producing structured errors in a handler
