@@ -3,6 +3,19 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: type-safe trace deletion (minor release)
+
+`delete_trace` now accepts only a UUID observed in the requested live board's
+trace-segment inventory. Via, zone, graphic, footprint, missing, and stale UUIDs
+return `stale_target` before `DeleteItems` is sent. A successful call reads the
+same board again and refuses success if the segment remains.
+
+The existing `deleted_uuid` field remains, but it is now derived from the
+observed segment rather than echoed from the request. Results add
+`deleted_type: "trace_segment"`, the observed net/layer/width/endpoints under
+`preimage`, and `postcondition: "absent_from_trace_readback"`. No argument or
+tool was renamed or removed.
+
 ## Unreleased: connectivity-safe component deletion (minor release)
 
 `delete_schematic_component`, `batch_delete`, and
