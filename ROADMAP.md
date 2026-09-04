@@ -23,12 +23,6 @@ real KiCad output. New guards must be neutralized once to prove their regression
 tests fail, and an unavailable check is `BLOCKED`, never a silent pass.
 
 Current Priority 0 work:
-
-- **Verified export artifacts**
-  ([#252](https://github.com/mixelpixx/Konnect/issues/252)) — run each export
-  in a fresh staging location, verify the complete current-invocation result,
-  and publish only the verified manifest. A pre-existing non-empty artifact
-  must never satisfy a new export.
 - **Exact live-board identity**
   ([#384](https://github.com/mixelpixx/Konnect/issues/384),
   [#390](https://github.com/mixelpixx/Konnect/pull/390)) — bind each generic
@@ -61,8 +55,8 @@ Current Priority 0 work:
 Completed foundations include structured required-argument validation,
 lossless zone and footprint parsing, proven project ownership (#189),
 process-lifetime stale-board refusal (#240), non-mutating startup (#242),
-and structural replacement of the remaining indentation-sensitive schematic
-scans (#84).
+verified fresh export artifacts (#252), and structural replacement of the
+remaining indentation-sensitive schematic scans (#84).
 
 ## 2. Schematic correctness and editability
 
