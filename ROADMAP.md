@@ -34,6 +34,11 @@ Current Priority 0 work:
   [#390](https://github.com/mixelpixx/Konnect/pull/390)) — bind each generic
   IPC operation to the exact typed document selected for the request. This is
   the foundation for later editor navigation.
+- **Fail-closed open-board classification**
+  ([#426](https://github.com/mixelpixx/Konnect/issues/426)) — if any open PCB
+  document path cannot be resolved, refuse direct-file mutation instead of
+  treating the requested board as safely closed. Rebuild PR #407 on current
+  `main` with negative and live-KiCad evidence.
 - **Cold-start stale-board evidence**
   ([#385](https://github.com/mixelpixx/Konnect/issues/385),
   [#391](https://github.com/mixelpixx/Konnect/pull/391)) — after exact board
