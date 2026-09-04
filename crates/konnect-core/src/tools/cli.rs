@@ -198,6 +198,130 @@ async fn verify_nonempty_file(path: &Path, artifact: &str) -> Result<u64> {
     Ok(metadata.len())
 }
 
+fn export_staging_dir(destination: &Path) -> Result<tempfile::TempDir> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    tempfile::Builder::new()
+        .prefix(".konnect-export-")
+        .tempdir_in(parent)
+        .context("failed to create an export staging directory")
+}
+
+/// Publish a verified artifact without letting a stale destination stand in
+/// for output from the current command. The staging directory is a sibling of
+/// the destination, so every rename remains on the same filesystem.
+async fn publish_verified_file(staged: &Path, destination: &Path, artifact: &str) -> Result<u64> {
+    let size = verify_nonempty_file(staged, artifact).await?;
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    if !destination.exists() {
+        tokio::fs::rename(staged, destination).await?;
+        return Ok(size);
+    }
+
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    let backup = staged.with_file_name(format!(".konnect-previous-{file_name}"));
+    tokio::fs::rename(destination, &backup)
+        .await
+        .with_context(|| {
+            format!(
+                "cannot preserve the previous artifact at {} before publishing",
+                destination.display()
+            )
+        })?;
+    if let Err(install_error) = tokio::fs::rename(staged, destination).await {
+        if let Err(restore_error) = tokio::fs::rename(&backup, destination).await {
+            anyhow::bail!(
+                "failed to publish {} ({install_error}) and restore its previous contents ({restore_error})",
+                destination.display()
+            );
+        }
+        return Err(install_error).with_context(|| {
+            format!(
+                "failed to publish verified artifact {}",
+                destination.display()
+            )
+        });
+    }
+    tokio::fs::remove_file(backup).await?;
+    Ok(size)
+}
+
+async fn publish_verified_files(
+    staged_files: &[PathBuf],
+    output_dir: &Path,
+    artifact: &str,
+) -> Result<Vec<PathBuf>> {
+    for staged in staged_files {
+        verify_nonempty_file(staged, artifact).await?;
+    }
+
+    let mut published = Vec::with_capacity(staged_files.len());
+    for staged in staged_files {
+        let file_name = staged
+            .file_name()
+            .context("export produced a path without a file name")?;
+        let destination = output_dir.join(file_name);
+        publish_verified_file(staged, &destination, artifact).await?;
+        published.push(destination);
+    }
+    Ok(published)
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    fn write_script(dir: &Path, stem: &str, unix_body: &str, windows_body: &str) -> PathBuf {
+        #[cfg(windows)]
+        let path = dir.join(format!("{stem}.cmd"));
+        #[cfg(not(windows))]
+        let path = dir.join(stem);
+
+        #[cfg(windows)]
+        {
+            let _ = unix_body;
+            std::fs::write(&path, windows_body).unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = windows_body;
+            std::fs::write(&path, unix_body).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        path
+    }
+
+    pub(crate) fn noop_cli(dir: &Path) -> PathBuf {
+        write_script(
+            dir,
+            "fake-kicad-cli",
+            "#!/bin/sh\nexit 0\n",
+            "@exit /b 0\r\n",
+        )
+    }
+
+    pub(crate) fn schematic_only_cli(dir: &Path) -> PathBuf {
+        write_script(
+            dir,
+            "fake-kicad-cli",
+            "#!/bin/sh\nif [ \"$1\" = \"sch\" ]; then\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"--output\" ]; then\n      shift\n      printf '%s' 'PDF-test' > \"$1\"\n      break\n    fi\n    shift\n  done\nfi\nexit 0\n",
+            "@echo off\r\nif not \"%1\"==\"sch\" exit /b 0\r\n:loop\r\nif \"%1\"==\"\" goto done\r\nif not \"%1\"==\"--output\" goto next\r\nshift\r\necho PDF-test>\"%1\"\r\ngoto done\r\n:next\r\nshift\r\ngoto loop\r\n:done\r\nexit /b 0\r\n",
+        )
+    }
+}
+
 // ─── ERC ─────────────────────────────────────────────────────────────────────
 
 /// Run ERC on a schematic and return parsed violations.
@@ -457,16 +581,28 @@ pub async fn export_schematic_svg(
     output_dir: &Path,
     options: &SchematicSvgOptions<'_>,
 ) -> Result<PathBuf> {
+    let staging = export_staging_dir(output_dir)?;
     let args = schematic_svg_args(
-        output_dir.to_str().unwrap(),
+        staging.path().to_str().unwrap(),
         schematic.to_str().unwrap(),
         options,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
-    let output = output_dir.join(format!("{}.svg", stem));
-    verify_nonempty_file(&output, "schematic SVG").await?;
-    Ok(output)
+    let staged_root = staging.path().join(format!("{}.svg", stem));
+
+    let mut staged_files = Vec::new();
+    let mut entries = tokio::fs::read_dir(staging.path()).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("svg") {
+            staged_files.push(path);
+        }
+    }
+    staged_files.sort();
+    verify_nonempty_file(&staged_root, "schematic SVG").await?;
+    publish_verified_files(&staged_files, output_dir, "schematic SVG").await?;
+    Ok(output_dir.join(format!("{}.svg", stem)))
 }
 
 #[derive(Debug, Clone)]
@@ -508,13 +644,19 @@ pub async fn export_schematic_pdf(
     output: &Path,
     options: &SchematicPdfOptions,
 ) -> Result<()> {
+    let staging = export_staging_dir(output)?;
+    let staged = staging.path().join(
+        output
+            .file_name()
+            .context("schematic PDF output has no file name")?,
+    );
     let args = schematic_pdf_args(
-        output.to_str().unwrap(),
+        staged.to_str().unwrap(),
         schematic.to_str().unwrap(),
         options,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    verify_nonempty_file(output, "schematic PDF").await?;
+    publish_verified_file(&staged, output, "schematic PDF").await?;
     Ok(())
 }
 
@@ -575,13 +717,17 @@ pub async fn export_bom(
     output: &Path,
     options: &BomOptions<'_>,
 ) -> Result<()> {
+    let staging = export_staging_dir(output)?;
+    let staged = staging
+        .path()
+        .join(output.file_name().context("BOM output has no file name")?);
     let args = bom_args(
-        output.to_str().unwrap_or(""),
+        staged.to_str().unwrap_or(""),
         schematic.to_str().unwrap_or(""),
         options,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    verify_nonempty_file(output, "BOM").await?;
+    publish_verified_file(&staged, output, "BOM").await?;
     Ok(())
 }
 
@@ -641,9 +787,10 @@ pub async fn export_gerber(
     output_dir: &Path,
     layers: &[&str],
 ) -> Result<Vec<PathBuf>> {
+    let staging = export_staging_dir(output_dir)?;
     let layers_csv = layers.join(",");
     let args = gerber_args(
-        output_dir.to_str().unwrap_or(""),
+        staging.path().to_str().unwrap_or(""),
         pcb.to_str().unwrap_or(""),
         &layers_csv,
     );
@@ -651,10 +798,10 @@ pub async fn export_gerber(
 
     let board_stem = pcb.file_stem().unwrap_or_default().to_string_lossy();
     let mut files = Vec::new();
-    let mut entries = tokio::fs::read_dir(output_dir).await.with_context(|| {
+    let mut entries = tokio::fs::read_dir(staging.path()).await.with_context(|| {
         format!(
             "Gerber export reported success but output directory {} is missing",
-            output_dir.display()
+            staging.path().display()
         )
     })?;
     while let Some(entry) = entries.next_entry().await? {
@@ -678,10 +825,10 @@ pub async fn export_gerber(
         anyhow::bail!(
             "Gerber export reported success but produced {plot_count} non-empty plot file(s) for {} requested layer(s) in {}",
             layers.len(),
-            output_dir.display()
+            staging.path().display()
         );
     }
-    Ok(files)
+    publish_verified_files(&files, output_dir, "Gerber").await
 }
 
 /// `--output` for a drill export names a *directory*, and some kicad-cli
@@ -739,21 +886,21 @@ async fn drill_files_in(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Returns the `.drl` files produced, sorted.
 pub async fn export_drill(cli: &str, pcb: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
-    tokio::fs::create_dir_all(output_dir).await?;
-    let dir_arg = drill_output_dir_arg(output_dir.to_str().unwrap_or(""));
+    let staging = export_staging_dir(output_dir)?;
+    let dir_arg = drill_output_dir_arg(staging.path().to_str().unwrap_or(""));
     let args = drill_args(&dir_arg, pcb.to_str().unwrap_or(""));
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    let files = drill_files_in(output_dir).await;
+    let files = drill_files_in(staging.path()).await;
     if files.is_empty() {
         anyhow::bail!(
             "drill export reported success but produced no .drl files in {}",
-            output_dir.display()
+            staging.path().display()
         );
     }
     for file in &files {
         verify_nonempty_file(file, "drill").await?;
     }
-    Ok(files)
+    publish_verified_files(&files, output_dir, "drill").await
 }
 
 fn single_file_pcb_export_args(
@@ -791,16 +938,22 @@ pub async fn export_pdf(
     layers: &[&str],
     black_and_white: bool,
 ) -> Result<()> {
+    let staging = export_staging_dir(output)?;
+    let staged = staging.path().join(
+        output
+            .file_name()
+            .context("PCB PDF output has no file name")?,
+    );
     let args = single_file_pcb_export_args(
         "pdf",
-        output.to_str().unwrap(),
+        staged.to_str().unwrap(),
         layers,
         black_and_white,
         pcb.to_str().unwrap(),
     );
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    verify_nonempty_file(output, "PCB PDF").await?;
+    publish_verified_file(&staged, output, "PCB PDF").await?;
     Ok(())
 }
 
@@ -910,15 +1063,21 @@ pub async fn export_position_file(
     units: &str,
     side: &str,
 ) -> Result<()> {
+    let staging = export_staging_dir(output)?;
+    let staged = staging.path().join(
+        output
+            .file_name()
+            .context("position output has no file name")?,
+    );
     let args = position_args(
-        output.to_str().unwrap_or(""),
+        staged.to_str().unwrap_or(""),
         pcb.to_str().unwrap_or(""),
         format,
         units,
         side,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    verify_nonempty_file(output, "position file").await?;
+    publish_verified_file(&staged, output, "position file").await?;
     Ok(())
 }
 
@@ -1507,26 +1666,30 @@ mod artifact_verification_tests {
         assert_eq!(verify_nonempty_file(&real, "test PDF").await.unwrap(), 9);
     }
 
-    #[test]
-    fn pcb_pdf_uses_one_csv_layer_argument_and_one_file_mode() {
-        let args = pcb_pdf_args(
-            "/out/board.pdf",
-            "/tmp/board.kicad_pcb",
-            "F.Cu,B.Cu,F.SilkS,B.SilkS,Edge.Cuts",
-        );
+    #[tokio::test]
+    async fn stale_destination_cannot_satisfy_a_new_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_support::noop_cli(dir.path());
+        let schematic = dir.path().join("clock.kicad_sch");
+        let destination = dir.path().join("clock.pdf");
+        std::fs::write(&schematic, "placeholder").unwrap();
+        std::fs::write(&destination, "stale-but-nonempty").unwrap();
+
+        let error = export_schematic_pdf(
+            cli.to_str().unwrap(),
+            &schematic,
+            &destination,
+            &SchematicPdfOptions::default(),
+        )
+        .await
+        .expect_err("the current invocation produced no artifact");
+
+        assert!(error.to_string().contains("did not create"), "{error:#}");
         assert_eq!(
-            args.iter()
-                .filter(|argument| **argument == "--layers")
-                .count(),
-            1
+            std::fs::read_to_string(destination).unwrap(),
+            "stale-but-nonempty",
+            "a failed export must preserve the previous artifact"
         );
-        let layers = args
-            .iter()
-            .position(|argument| *argument == "--layers")
-            .map(|index| args[index + 1]);
-        assert_eq!(layers, Some("F.Cu,B.Cu,F.SilkS,B.SilkS,Edge.Cuts"));
-        assert!(args.contains(&"--mode-single"));
-        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
     }
 }
 

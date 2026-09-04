@@ -488,14 +488,8 @@ async fn handle_snapshot_project(
         let pcb_pdf_name = format!("{}_pcb_{}_{}.pdf", stem, label, ts);
         let pcb_pdf_path = output_dir.join(&pcb_pdf_name);
         let layers = &["F.Cu", "B.Cu", "F.Silkscreen", "B.Silkscreen", "Edge.Cuts"];
-        crate::tools::cli::export_pdf(
-            &ctx.config.kicad_cli,
-            &pcb,
-            &pcb_pdf_path,
-            layers,
-            false,
-        )
-        .await?;
+        crate::tools::cli::export_pdf(&ctx.config.kicad_cli, &pcb, &pcb_pdf_path, layers, false)
+            .await?;
         result["pcb_snapshot"] = json!(pcb_pdf_path.display().to_string());
     }
 
@@ -889,24 +883,13 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn snapshot_propagates_a_missing_pcb_artifact() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
-        let cli = dir.path().join("fake-kicad-cli");
         // Produce the first (schematic) PDF, then report success without
         // producing the PCB PDF. This is the exact phantom-path failure #252
         // described, independent of whether a real KiCad is installed.
-        std::fs::write(
-            &cli,
-            "#!/bin/sh\nif [ \"$1\" = \"sch\" ]; then\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"--output\" ]; then\n      shift\n      printf '%s' '%PDF-test' > \"$1\"\n      break\n    fi\n    shift\n  done\nfi\nexit 0\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&cli).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&cli, permissions).unwrap();
+        let cli = crate::tools::cli::test_support::schematic_only_cli(dir.path());
 
         let schematic = dir.path().join("voice.kicad_sch");
         let board = dir.path().join("voice.kicad_pcb");

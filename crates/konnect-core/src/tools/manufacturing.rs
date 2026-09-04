@@ -326,7 +326,7 @@ async fn handle_export_manufacturing_package(
 
     let next_steps = if complete {
         format!(
-                "Upload the contents of {} to {}'s order page. Gerbers go in the PCB order, BOM + positions go in the assembly order.",
+                "Upload only the verified paths listed in `files` from {} to {}'s order page. Gerbers go in the PCB order, BOM + positions go in the assembly order.",
                 output_dir.display(),
                 fab_house.to_uppercase()
             )
@@ -650,11 +650,8 @@ mod package_export_option_tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn package_is_an_error_when_cli_success_produces_no_artifacts() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("live_ipc.kicad_pcb");
         // Real KiCad 9 output, as required for tests that parse board layers.
@@ -663,11 +660,7 @@ mod package_export_option_tests {
             include_str!("../../../konnect-ipc/tests/fixtures/live_ipc.kicad_pcb"),
         )
         .unwrap();
-        let cli = dir.path().join("fake-kicad-cli");
-        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = std::fs::metadata(&cli).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&cli, permissions).unwrap();
+        let cli = crate::tools::cli::test_support::noop_cli(dir.path());
         let ctx = ToolContext::new(
             crate::tools::ServerConfig {
                 kicad_cli: cli.display().to_string(),
