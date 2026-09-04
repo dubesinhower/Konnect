@@ -488,14 +488,8 @@ async fn handle_snapshot_project(
         let pcb_pdf_name = format!("{}_pcb_{}_{}.pdf", stem, label, ts);
         let pcb_pdf_path = output_dir.join(&pcb_pdf_name);
         let layers = &["F.Cu", "B.Cu", "F.Silkscreen", "B.Silkscreen", "Edge.Cuts"];
-        let _ = crate::tools::cli::export_pdf(
-            &ctx.config.kicad_cli,
-            &pcb,
-            &pcb_pdf_path,
-            layers,
-            false,
-        )
-        .await;
+        crate::tools::cli::export_pdf(&ctx.config.kicad_cli, &pcb, &pcb_pdf_path, layers, false)
+            .await?;
         result["pcb_snapshot"] = json!(pcb_pdf_path.display().to_string());
     }
 
@@ -887,6 +881,46 @@ mod tests {
             extract_error_kind(&result).as_deref(),
             Some("file_not_found")
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_propagates_a_missing_pcb_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        // Produce the first (schematic) PDF, then report success without
+        // producing the PCB PDF. This is the exact phantom-path failure #252
+        // described, independent of whether a real KiCad is installed.
+        let cli = crate::tools::cli::test_support::schematic_only_cli(dir.path());
+
+        let schematic = dir.path().join("voice.kicad_sch");
+        let board = dir.path().join("voice.kicad_pcb");
+        std::fs::write(&schematic, "placeholder").unwrap();
+        std::fs::write(&board, "placeholder").unwrap();
+        let ctx = ToolContext::new(
+            ServerConfig {
+                kicad_cli: cli.display().to_string(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        );
+
+        let error = handle_snapshot_project(
+            &json!({
+                "schematic": schematic.display().to_string(),
+                "pcb": board.display().to_string(),
+                "output_dir": dir.path().join("snapshots").display().to_string(),
+                "label": "regression"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("missing PCB PDF must fail the snapshot call");
+        assert!(error.to_string().contains("did not create"), "{error:#}");
+        assert!(error.to_string().contains("pcb"), "{error:#}");
     }
 
     fn response_json(result: &CallToolResult) -> serde_json::Value {
