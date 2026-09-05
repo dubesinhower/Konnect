@@ -26,8 +26,20 @@ placement evidence including `schematic`, `reference`, `uuid`, `lib_id`,
 `unit_count`, `units`, `fields`, coordinates, rotation, and instance paths or
 references where applicable. Grouping returns the same evidence per component.
 
+Success additionally requires every bound unit's observed unit number, library
+ID, project/hierarchy paths, x/y, rotation, and property values to match the
+preselected target plus the intended mutation. Placement compares requested
+Reference/Value, library and unit, and its tool's coordinate rules (component
+placement snaps to 1.27 mm; power placement retains requested coordinates).
+Edits preserve the other bound values; moves preserve relative unit positions,
+and rotations preserve relative unit angles. Coordinate/angle comparisons allow
+only serialization rounding below 0.000001 mm/degrees.
+
 Missing, malformed, stale-revision, or wrong-document identities refuse with
-`stale_target`. Duplicate UUID, reference/unit, or property identities refuse
+`stale_target`, including mismatched intended values. Component-target
+resolution and committed readback reject duplicate UUID, reference/unit,
+property, or instance identities and conflicting project, instance-unit,
+or cross-unit hierarchy records
 with the new `ambiguous_target` kind and include their candidates whenever
 Konnect cannot prove one top-level symbol per bound UUID and one logical
 reference across its units. A

@@ -577,6 +577,10 @@ async fn handle_add_schematic_component(
         Err(e) => return Ok(e),
     };
 
+    let (expected_x, expected_y) = snap_point(x, y, 1.27);
+    let placement = ComponentTargetUnit::placement(
+        &uuid, &context, &lib_id, expected_x, expected_y, rotation, ref_str, value, unit,
+    );
     sch.overwrite()?;
 
     // A pin landing mid-segment on an existing wire needs a junction dot, or
@@ -585,7 +589,7 @@ async fn handle_add_schematic_component(
     // path can do one junction pass for the whole batch instead of one per part.
     let junctions = crate::tools::add_pin_midwire_junctions(&sch_path, ref_str)?;
     let committed = cse::Schematic::load(&sch_path)?;
-    let mut result = match placed_component_readback(&sch_path, &committed, &uuid, &context) {
+    let mut result = match placed_component_readback(&sch_path, &committed, &placement, &context) {
         Ok(result) => result,
         Err(error) => return Ok(error),
     };
@@ -715,10 +719,178 @@ pub(crate) fn place_one_component(
 }
 
 #[derive(Debug, Clone)]
-struct ComponentTargetUnit {
+pub(crate) struct ComponentTargetUnit {
     uuid: String,
     unit: u32,
     fields: BTreeMap<String, String>,
+    lib_id: String,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    instances: Vec<(String, String)>,
+}
+
+impl ComponentTargetUnit {
+    /// Bind placement intent independently of the model produced by the writer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn placement(
+        uuid: &str,
+        context: &crate::tools::SheetInstanceContext,
+        lib_id: &str,
+        x: f64,
+        y: f64,
+        rotation: f64,
+        reference: &str,
+        value: Option<&str>,
+        unit: u32,
+    ) -> Self {
+        let mut instances = context
+            .instance_paths
+            .iter()
+            .map(|path| (context.project_name.clone(), path.clone()))
+            .collect::<Vec<_>>();
+        instances.sort();
+        Self {
+            uuid: uuid.to_owned(),
+            unit,
+            lib_id: lib_id.to_owned(),
+            x,
+            y,
+            rotation,
+            fields: BTreeMap::from([
+                ("Reference".to_owned(), reference.to_owned()),
+                (
+                    "Value".to_owned(),
+                    value
+                        .unwrap_or_else(|| lib_id.rsplit(':').next().unwrap_or(lib_id))
+                        .to_owned(),
+                ),
+            ]),
+            instances,
+        }
+    }
+}
+
+/// Inspect every record before sorting: duplicate identities and conflicting
+/// project/unit records must not be collapsed into a plausible first answer.
+fn checked_instance_paths(
+    path: &std::path::Path,
+    symbol: &cse::Symbol,
+) -> Result<Vec<(String, String)>, ComponentDeleteTargetError> {
+    let mut identities = BTreeSet::new();
+    let mut projects = BTreeSet::new();
+    for instance in symbol.instances() {
+        let (Some(project), Some(instance_path), Some(reference), Some(unit)) = (
+            instance.project,
+            instance.path,
+            instance.reference,
+            instance.unit,
+        ) else {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!(
+                    "component UUID {} has incomplete instance metadata",
+                    symbol.uuid
+                ),
+            ));
+        };
+        if symbol.reference() != Some(reference.as_str()) {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!(
+                    "component UUID {} has a conflicting instance reference",
+                    symbol.uuid
+                ),
+            ));
+        }
+        projects.insert(project.clone());
+        if unit != symbol.unit || !identities.insert((project, instance_path)) || projects.len() > 1
+        {
+            return Err(ComponentDeleteTargetError::Ambiguous {
+                target: format!("component UUID {} instance records", symbol.uuid),
+                candidates: symbol
+                    .instances()
+                    .iter()
+                    .map(|entry| format!("{entry:?}"))
+                    .collect(),
+            });
+        }
+    }
+    Ok(identities.into_iter().collect())
+}
+
+fn verify_component_expectations(
+    path: &std::path::Path,
+    observed: &serde_json::Value,
+    expected: &[ComponentTargetUnit],
+) -> Result<(), CallToolResult> {
+    for target in expected {
+        let unit = observed["units"]
+            .as_array()
+            .and_then(|units| {
+                units
+                    .iter()
+                    .find(|unit| unit["uuid"].as_str() == Some(&target.uuid))
+            })
+            .ok_or_else(|| {
+                ComponentDeleteTargetError::stale(path, "bound unit missing from readback")
+                    .into_result()
+            })?;
+        // Separate comparisons keep each identity/intent obligation explicit.
+        for (field, matches) in [
+            (
+                "unit",
+                unit["unit"].as_u64() == Some(u64::from(target.unit)),
+            ),
+            ("lib_id", unit["lib_id"].as_str() == Some(&target.lib_id)),
+            (
+                "x",
+                unit["x"]
+                    .as_f64()
+                    .is_some_and(|v| (v - target.x).abs() < 1e-6),
+            ),
+            (
+                "y",
+                unit["y"]
+                    .as_f64()
+                    .is_some_and(|v| (v - target.y).abs() < 1e-6),
+            ),
+            (
+                "rotation",
+                unit["rotation"]
+                    .as_f64()
+                    .is_some_and(|v| (v - target.rotation).abs() < 1e-6),
+            ),
+            (
+                "instance_paths",
+                unit["instance_paths"] == json!(target.instances),
+            ),
+        ] {
+            if !matches {
+                return Err(ComponentDeleteTargetError::stale(
+                    path,
+                    format!(
+                        "post-write {field} differs from bound intent for UUID {}",
+                        target.uuid
+                    ),
+                )
+                .into_result());
+            }
+        }
+        for (field, value) in &target.fields {
+            if unit["fields"][field].as_str() != Some(value) {
+                return Err(ComponentDeleteTargetError::stale(
+                    path,
+                    format!(
+                        "post-write property {field} differs from bound intent for UUID {}",
+                        target.uuid
+                    ),
+                )
+                .into_result());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -728,6 +900,17 @@ struct ComponentTarget {
 }
 
 impl ComponentTarget {
+    fn with_fields(&self, fields: &BTreeMap<String, String>) -> Self {
+        let mut expected = self.clone();
+        if let Some(reference) = fields.get("Reference") {
+            expected.reference = reference.clone();
+        }
+        for unit in &mut expected.units {
+            unit.fields.extend(fields.clone());
+        }
+        expected
+    }
+
     fn uuids(&self) -> Vec<String> {
         self.units.iter().map(|unit| unit.uuid.clone()).collect()
     }
@@ -826,16 +1009,37 @@ fn component_target_from_source(
             }
         }
         by_unit.entry(instance.unit).or_default().push(uuid.clone());
+        let symbol = cse::sexp::parser::parse(&item.source)
+            .and_then(|node| cse::Symbol::from_sexp(&node))
+            .map_err(|error| ComponentDeleteTargetError::stale(path, error.to_string()))?;
+        let instance_paths = checked_instance_paths(path, &symbol)?;
         units.push(ComponentTargetUnit {
             uuid,
             unit: instance.unit,
             fields,
+            lib_id: instance.lib_id,
+            x: instance.x,
+            y: instance.y,
+            rotation: instance.rotation,
+            instances: instance_paths,
         });
     }
     if let Some((unit, uuids)) = by_unit.iter().find(|(_, uuids)| uuids.len() > 1) {
         return Err(ComponentDeleteTargetError::Ambiguous {
             target: format!("component {reference} unit {unit}"),
             candidates: uuids.clone(),
+        });
+    }
+    if units
+        .iter()
+        .any(|unit| unit.instances != units[0].instances)
+    {
+        return Err(ComponentDeleteTargetError::Ambiguous {
+            target: format!("component {reference} hierarchy instances"),
+            candidates: units
+                .iter()
+                .map(|unit| format!("{}: {:?}", unit.uuid, unit.instances))
+                .collect(),
         });
     }
     units.sort_by(|left, right| {
@@ -948,6 +1152,7 @@ fn component_mutation_readback_from_schematic(
             .then_with(|| left.uuid.cmp(&right.uuid))
     });
     let mut units = Vec::new();
+    let mut component_instances = None;
     for symbol in &observed {
         let mut fields = BTreeMap::new();
         for property in &symbol.properties {
@@ -965,8 +1170,22 @@ fn component_mutation_readback_from_schematic(
                 .into_result());
             }
         }
-        let mut instance_paths = symbol.instance_paths();
-        instance_paths.sort();
+        let instance_paths =
+            checked_instance_paths(path, symbol).map_err(|error| error.into_result())?;
+        if component_instances
+            .as_ref()
+            .is_some_and(|expected| expected != &instance_paths)
+        {
+            return Err(ComponentDeleteTargetError::Ambiguous {
+                target: format!("component {reference} hierarchy instances"),
+                candidates: observed
+                    .iter()
+                    .map(|symbol| format!("{}: {:?}", symbol.uuid, symbol.instance_paths()))
+                    .collect(),
+            }
+            .into_result());
+        }
+        component_instances = Some(instance_paths.clone());
         let mut instance_references = Vec::new();
         for instances in symbol
             .raw_sub_nodes
@@ -1037,16 +1256,25 @@ fn component_mutation_readback_from_schematic(
 
 fn load_component_mutation_readback(
     path: &std::path::Path,
-    expected_uuids: &[String],
-    expected_reference: Option<&str>,
+    expected: &ComponentTarget,
 ) -> anyhow::Result<Result<serde_json::Value, CallToolResult>> {
     let committed = cse::Schematic::load(path)?;
-    Ok(component_mutation_readback_from_schematic(
+    Ok(verified_component_readback(path, &committed, expected))
+}
+
+fn verified_component_readback(
+    path: &std::path::Path,
+    committed: &cse::Schematic,
+    expected: &ComponentTarget,
+) -> Result<serde_json::Value, CallToolResult> {
+    let observed = component_mutation_readback_from_schematic(
         path,
-        &committed,
-        expected_uuids,
-        expected_reference,
-    ))
+        committed,
+        &expected.uuids(),
+        Some(&expected.reference),
+    )?;
+    verify_component_expectations(path, &observed, &expected.units)?;
+    Ok(observed)
 }
 
 fn copy_component_observation(result: &mut serde_json::Value, observed: &serde_json::Value) {
@@ -1102,7 +1330,7 @@ fn verify_observed_field(
 pub(crate) fn placed_component_readback(
     sch_path: &std::path::Path,
     committed: &cse::Schematic,
-    uuid: &str,
+    expected: &ComponentTargetUnit,
     context: &crate::tools::SheetInstanceContext,
 ) -> Result<serde_json::Value, CallToolResult> {
     if !super::same_schematic_document(sch_path, committed.filepath()) {
@@ -1112,15 +1340,21 @@ pub(crate) fn placed_component_readback(
         }
         .into_tool_result());
     }
+    let uuid = &expected.uuid;
+    let mut result = component_mutation_readback_from_schematic(
+        sch_path,
+        committed,
+        &[uuid.to_owned()],
+        expected.fields.get("Reference").map(String::as_str),
+    )?;
+    verify_component_expectations(sch_path, &result, std::slice::from_ref(expected))?;
     if let Err(error) = crate::tools::validate_sheet_instance_state(sch_path, committed, context) {
         return Err(error.into_tool_result());
     }
-    let mut result =
-        component_mutation_readback_from_schematic(sch_path, committed, &[uuid.to_owned()], None)?;
     let symbol = committed
         .symbols
         .iter()
-        .find(|symbol| symbol.uuid == uuid)
+        .find(|symbol| symbol.uuid == *uuid)
         .expect("shared readback proved this UUID");
     let mut observed_instances = symbol.instance_paths();
     observed_instances.sort();
@@ -1879,6 +2113,7 @@ async fn handle_edit_schematic_component(
     };
     let mut changed = Vec::new();
     let mut expected_fields = BTreeMap::new();
+    let mut edit_reference = reference.as_str();
 
     let mut errors: Vec<String> = Vec::new();
     // A macro rather than a closure: the body also needs `changed`/`errors`
@@ -1886,7 +2121,7 @@ async fn handle_edit_schematic_component(
     // and a closure capturing them mutably would lock both for its lifetime.
     macro_rules! apply {
         ($field:expr, $new_val:expr) => {
-            match set_property_value(&content, &reference, $field, $new_val, false) {
+            match set_property_value(&content, edit_reference, $field, $new_val, false) {
                 Ok((updated, counts)) => {
                     content = updated;
                     expected_fields.insert($field.to_owned(), $new_val.to_owned());
@@ -1913,6 +2148,7 @@ async fn handle_edit_schematic_component(
         match rewrite_instance_references(&content, &reference, new_ref) {
             Ok((updated, count)) => {
                 content = updated;
+                edit_reference = new_ref;
                 changed.push(format!("instances reference → {new_ref} ({count})"));
             }
             Err(why) => {
@@ -1951,7 +2187,7 @@ async fn handle_edit_schematic_component(
                 ));
                 continue;
             }
-            match set_property_value(&content, &reference, name, value, true) {
+            match set_property_value(&content, edit_reference, name, value, true) {
                 Ok((updated, counts)) => {
                     content = updated;
                     expected_fields.insert(name.clone(), value.to_owned());
@@ -1997,23 +2233,11 @@ async fn handle_edit_schematic_component(
         commit_command(&sch_path, &command)?;
     }
 
-    let observed_reference = expected_fields
-        .get("Reference")
-        .map(String::as_str)
-        .unwrap_or(reference.as_str());
-    let observed = match load_component_mutation_readback(
-        &sch_path,
-        &target.uuids(),
-        Some(observed_reference),
-    )? {
-        Ok(observed) => observed,
-        Err(error) => return Ok(error),
-    };
-    for (field, value) in &expected_fields {
-        if let Err(error) = verify_observed_field(&sch_path, &observed, field, value) {
-            return Ok(error);
-        }
-    }
+    let observed =
+        match load_component_mutation_readback(&sch_path, &target.with_fields(&expected_fields))? {
+            Ok(observed) => observed,
+            Err(error) => return Ok(error),
+        };
     let mut result = json!({
         "reference": observed["reference"],
         "changes": changed
@@ -2152,7 +2376,7 @@ async fn handle_move_schematic_component(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+    let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -2166,6 +2390,10 @@ async fn handle_move_schematic_component(
         .expect("structural target UUID is present in the loaded schematic");
     let (old_x, old_y) = anchor.position();
     let (dx, dy) = (new_x - old_x, new_y - old_y);
+    for unit in &mut target.units {
+        unit.x += dx;
+        unit.y += dy;
+    }
     for symbol in sch
         .symbols
         .iter_mut()
@@ -2175,11 +2403,7 @@ async fn handle_move_schematic_component(
     }
     sch.overwrite()?;
     let (added, pruned) = reconcile_junctions_after_move(&sch_path, &before_pins)?;
-    let observed = match load_component_mutation_readback(
-        &sch_path,
-        &target_uuids,
-        Some(&target.reference),
-    )? {
+    let observed = match load_component_mutation_readback(&sch_path, &target)? {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
     };
@@ -2257,7 +2481,7 @@ async fn handle_rotate_schematic_component(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+    let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -2270,6 +2494,9 @@ async fn handle_rotate_schematic_component(
         .find(|symbol| symbol.uuid == *anchor_uuid)
         .expect("structural target UUID is present in the loaded schematic");
     let rotation_delta = rotation - anchor.at.rotation.unwrap_or(0.0);
+    for unit in &mut target.units {
+        unit.rotation = (unit.rotation + rotation_delta).rem_euclid(360.0);
+    }
     for symbol in sch
         .symbols
         .iter_mut()
@@ -2285,11 +2512,7 @@ async fn handle_rotate_schematic_component(
         symbol.set_rotation(new_rotation);
     }
     sch.overwrite()?;
-    let observed = match load_component_mutation_readback(
-        &sch_path,
-        &target_uuids,
-        Some(&target.reference),
-    )? {
+    let observed = match load_component_mutation_readback(&sch_path, &target)? {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
     };
@@ -2634,8 +2857,7 @@ async fn handle_add_component_annotation(
 
     let observed = match load_component_mutation_readback(
         &sch_path,
-        &target.uuids(),
-        Some(&target.reference),
+        &target.with_fields(&BTreeMap::from([(key.clone(), value.clone())])),
     )? {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
@@ -2742,11 +2964,10 @@ async fn handle_group_components(
     let mut grouped = Vec::new();
     let mut components = Vec::new();
     for target in &targets {
-        let observed = match component_mutation_readback_from_schematic(
+        let observed = match verified_component_readback(
             &sch_path,
             &committed,
-            &target.uuids(),
-            Some(&target.reference),
+            &target.with_fields(&BTreeMap::from([("Group".to_owned(), group_name.clone())])),
         ) {
             Ok(observed) => observed,
             Err(error) => return Ok(error),
@@ -5444,6 +5665,240 @@ mod multi_unit_component_tests {
         (directory, path)
     }
 
+    fn native_readback_intent_mismatch(field: &str) {
+        let (_directory, path) = eeschema_fixture();
+        let mut committed = cse::Schematic::load(&path).unwrap();
+        let target = component_target_from_source(&path, &committed.to_source(), "U1").unwrap();
+        assert!(verified_component_readback(&path, &committed, &target).is_ok());
+        // Keep UUID and Reference intact. Change every unit's hierarchy together
+        // so the expected-path comparison, not a cross-unit conflict, must fire.
+        for symbol in committed
+            .symbols
+            .iter_mut()
+            .filter(|symbol| symbol.reference() == Some("U1"))
+        {
+            match field {
+                "unit" => {
+                    symbol.unit += 10;
+                    for (project, instance_path) in symbol.instance_paths() {
+                        symbol.set_instance_path(&project, &instance_path, "U1", symbol.unit);
+                    }
+                }
+                "lib_id" => symbol.lib_id = "Device:WRONG".to_owned(),
+                "x" => symbol.at.x += 1.27,
+                "y" => symbol.at.y += 1.27,
+                "rotation" => symbol.at.rotation = Some(symbol.at.rotation.unwrap_or(0.0) + 90.0),
+                "project" | "path" => {
+                    let previous = symbol.instance_paths();
+                    symbol
+                        .raw_sub_nodes
+                        .retain(|node| node.tag() != Some("instances"));
+                    for (project, instance_path) in previous {
+                        symbol.set_instance_path(
+                            if field == "project" {
+                                "wrong-project"
+                            } else {
+                                &project
+                            },
+                            if field == "path" {
+                                "/wrong/path"
+                            } else {
+                                &instance_path
+                            },
+                            "U1",
+                            symbol.unit,
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        committed.overwrite().unwrap();
+        let reloaded = cse::Schematic::load(&path).unwrap();
+        let error = verified_component_readback(&path, &reloaded, &target).unwrap_err();
+        assert_eq!(
+            extract_error_kind(&error).as_deref(),
+            Some("stale_target"),
+            "{field}: {error:?}"
+        );
+    }
+
+    #[test]
+    fn native_readback_intent_unit() {
+        native_readback_intent_mismatch("unit");
+    }
+    #[test]
+    fn native_readback_intent_library() {
+        native_readback_intent_mismatch("lib_id");
+    }
+    #[test]
+    fn native_readback_intent_x() {
+        native_readback_intent_mismatch("x");
+    }
+    #[test]
+    fn native_readback_intent_y() {
+        native_readback_intent_mismatch("y");
+    }
+    #[test]
+    fn native_readback_intent_rotation() {
+        native_readback_intent_mismatch("rotation");
+    }
+    #[test]
+    fn native_readback_intent_project() {
+        native_readback_intent_mismatch("project");
+    }
+    #[test]
+    fn native_readback_intent_path() {
+        native_readback_intent_mismatch("path");
+    }
+
+    #[test]
+    fn native_readback_intent_requested_properties() {
+        for field in ["Value", "Footprint", "Datasheet", "MPN", "Group"] {
+            let (_directory, path) = eeschema_fixture();
+            let mut committed = cse::Schematic::load(&path).unwrap();
+            let target = component_target_from_source(&path, &committed.to_source(), "U1")
+                .unwrap()
+                .with_fields(&BTreeMap::from([(
+                    field.to_owned(),
+                    "requested-value".to_owned(),
+                )]));
+            for symbol in committed
+                .symbols
+                .iter_mut()
+                .filter(|symbol| symbol.reference() == Some("U1"))
+            {
+                symbol.set_property(field, "requested-value");
+            }
+            committed.overwrite().unwrap();
+            assert!(verified_component_readback(
+                &path,
+                &cse::Schematic::load(&path).unwrap(),
+                &target
+            )
+            .is_ok());
+            committed
+                .symbols
+                .iter_mut()
+                .find(|symbol| symbol.reference() == Some("U1"))
+                .unwrap()
+                .set_property(field, "wrong-value");
+            committed.overwrite().unwrap();
+            let error =
+                verified_component_readback(&path, &cse::Schematic::load(&path).unwrap(), &target)
+                    .unwrap_err();
+            assert_eq!(
+                extract_error_kind(&error).as_deref(),
+                Some("stale_target"),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_readback_instance_conflicts() {
+        for corruption in ["project", "duplicate", "unit", "cross-unit"] {
+            let (_directory, path) = eeschema_fixture();
+            let mut committed = cse::Schematic::load(&path).unwrap();
+            let target = component_target_from_source(&path, &committed.to_source(), "U1").unwrap();
+            let symbol = committed
+                .symbols
+                .iter_mut()
+                .find(|symbol| symbol.reference() == Some("U1"))
+                .unwrap();
+            let (project, instance_path) = symbol.instance_paths()[0].clone();
+            match corruption {
+                "project" => {
+                    symbol.set_instance_path("other-project", &instance_path, "U1", symbol.unit)
+                }
+                "unit" => symbol.set_instance_path(&project, &instance_path, "U1", symbol.unit + 1),
+                "cross-unit" => {
+                    symbol
+                        .raw_sub_nodes
+                        .retain(|node| node.tag() != Some("instances"));
+                    symbol.set_instance_path(&project, "/other/path", "U1", symbol.unit);
+                }
+                "duplicate" => {
+                    let instances = symbol
+                        .raw_sub_nodes
+                        .iter()
+                        .find(|node| node.tag() == Some("instances"))
+                        .unwrap()
+                        .clone();
+                    symbol.raw_sub_nodes.push(instances);
+                }
+                _ => unreachable!(),
+            }
+            if corruption != "cross-unit" {
+                let error = checked_instance_paths(&path, symbol)
+                    .unwrap_err()
+                    .into_result();
+                assert_eq!(
+                    extract_error_kind(&error).as_deref(),
+                    Some("ambiguous_target"),
+                    "{corruption}"
+                );
+            }
+            committed.overwrite().unwrap();
+            let reloaded = cse::Schematic::load(&path).unwrap();
+            let error = verified_component_readback(&path, &reloaded, &target).unwrap_err();
+            assert_eq!(
+                extract_error_kind(&error).as_deref(),
+                Some("ambiguous_target"),
+                "{corruption}"
+            );
+            let preflight = component_target_from_source(&path, &reloaded.to_source(), "U1")
+                .unwrap_err()
+                .into_result();
+            assert_eq!(
+                extract_error_kind(&preflight).as_deref(),
+                Some("ambiguous_target"),
+                "{corruption}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_mutations_verify_each_units_intended_state() {
+        let (_directory, path) = eeschema_fixture();
+        body(
+            handle_move_schematic_component(
+                &json!({"schematic": path, "reference": "U1", "x": 110.1, "y": 120.2}),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        body(
+            handle_rotate_schematic_component(
+                &json!({"schematic": path, "reference": "U1", "rotation": 450.0}),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        let edited = body(handle_edit_schematic_component(&json!({"schematic": path, "reference": "U1", "new_reference": "U99", "value": "updated", "footprint": "Package:New", "datasheet": "https://example.invalid/datasheet", "fields": {"MPN": "requested"}}), &context()).await.unwrap());
+        assert_eq!(edited["reference"], "U99");
+        for unit in edited["units"].as_array().unwrap() {
+            assert_eq!(unit["fields"]["MPN"], "requested");
+            assert_eq!(unit["fields"]["Value"], "updated");
+            assert_eq!(unit["fields"]["Footprint"], "Package:New");
+            assert_eq!(
+                unit["fields"]["Datasheet"],
+                "https://example.invalid/datasheet"
+            );
+        }
+        let grouped = body(
+            handle_group_components(
+                &json!({"schematic": path, "references": ["U99"], "group_name": "native-group"}),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(grouped["grouped_count"], 1);
+    }
+
     #[tokio::test]
     async fn a_real_eeschema_multi_unit_component_is_seen_whole() {
         let (_directory, path) = eeschema_fixture();
@@ -5504,7 +5959,7 @@ mod multi_unit_component_tests {
     }
 
     fn body(result: CallToolResult) -> serde_json::Value {
-        assert!(!result.is_error, "mutation unexpectedly failed");
+        assert!(!result.is_error, "mutation unexpectedly failed: {result:?}");
         let ToolContent::Text { text } = &result.content[0] else {
             panic!("expected text result");
         };

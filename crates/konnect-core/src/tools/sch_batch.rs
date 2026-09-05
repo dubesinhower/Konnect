@@ -497,7 +497,7 @@ async fn handle_batch_place_components(
         Err(error) => return Ok(error.into_tool_result()),
     };
 
-    let mut placed_uuids = Vec::new();
+    let mut placements = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     for comp in &components {
@@ -527,17 +527,23 @@ async fn handle_batch_place_components(
             unit,
             &src,
         ) {
-            Ok(uuid) => placed_uuids.push(uuid),
+            Ok(uuid) => {
+                let (expected_x, expected_y) = snap_point(x, y, 1.27);
+                placements.push(super::sch_components::ComponentTargetUnit::placement(
+                    &uuid, &context, lib_id, expected_x, expected_y, rotation, reference, value,
+                    unit,
+                ));
+            }
             Err(e) => errors.push(error_text(&e)),
         }
     }
 
     let mut placed = Vec::new();
-    if !placed_uuids.is_empty() {
+    if !placements.is_empty() {
         sch.overwrite()?;
         let committed = cse::Schematic::load(&sch_path)?;
-        for uuid in &placed_uuids {
-            match placed_component_readback(&sch_path, &committed, uuid, &context) {
+        for placement in &placements {
+            match placed_component_readback(&sch_path, &committed, placement, &context) {
                 Ok(result) => placed.push(result),
                 Err(error) => return Ok(error),
             }
