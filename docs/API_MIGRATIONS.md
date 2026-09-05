@@ -3,6 +3,30 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: observed board fallback evidence (minor release)
+
+Guarded IPC-to-file board writes now return `fallback_reason: "board_not_open"`
+only when KiCad positively identifies the requested board as absent. Unreachable
+IPC returns `fallback_reason: "ipc_unreachable"`; it does not prove a board closed.
+The existing `warning` now explains the observed classification and retains the
+session-history and reload guidance. IPC success has no fallback reason; graphic
+deletion uses null for that field on IPC success and suppresses write warnings for
+dry runs.
+
+`get_component_pads` saved-file results carry the same `fallback_reason`, plus
+`fallback_detail` derived from the classified result. These additive fields do not
+turn a saved read into live evidence. `get_pad_position` carries those fields from
+the pad-list result. `source` retains its existing meaning.
+
+Unresolvable or ambiguous open-board identities return the structured
+`ambiguous_open_board` error, with the requested `path`; they are neither a KiCad
+rejection nor permission for file fallback. Previously observed live boards retain
+the process-lifetime `unsafe_file_fallback` mutation refusal.
+
+Windows live-path evidence exists on PR #407 head `ced0754`; Linux and macOS live
+document-path evidence remains outstanding. This is partial acceptance of #426,
+which must remain open until its platform requirements are met.
+
 ## Unreleased: type-safe trace deletion (minor release)
 
 `delete_trace` now accepts only a UUID observed in the requested live board's

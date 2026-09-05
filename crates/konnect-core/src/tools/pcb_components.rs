@@ -7,7 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
-use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite, FILE_FALLBACK_WARNING};
+use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite, NoLiveBoard};
 use crate::tools::{
     get_path, require_array, require_f64, require_str, require_u64, with_board_ipc_classified,
     ToolContext, ToolDef,
@@ -1971,8 +1971,9 @@ pub fn tools() -> Vec<ToolDef> {
             "get_component_pads",
             "Return live board-space pad positions, layers and net assignments for a footprint. \
              Reads the board open in KiCad when it is reachable and falls back to the file only \
-             when no live KiCad holds this board — IPC unreachable, or that board not open — \
-             'source' says which, so unsaved placements are visible without a save. \
+             on unreachable IPC or positive board absence; ambiguous identities refuse. \
+             'source' distinguishes live and saved data; 'fallback_reason' and \
+             'fallback_detail' preserve the observed reason for a saved read. \
              A pad's 'net' is its net name, \"\" if the pad carries no net \
              (unconnected), or — reading the file — null if the net node is present \
              but unreadable; treat null as an error, not as an unconnected pad.",
@@ -1989,7 +1990,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "get_pad_position",
-            "Return the live board-space position, layers and net of a specific pad number on a footprint.",
+            "Return one pad's board-space position, layers and net, preserving the pad-list source and fallback evidence.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2175,7 +2176,7 @@ async fn handle_place_component(
             "source": "ipc"
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(_) => {
+        BoardWrite::File(reason) => {
             // No live KiCad on the other end of this transport: fall back to
             // editing the board file directly.
             if board_contains_reference(&board, &reference)? {
@@ -2207,7 +2208,7 @@ async fn handle_place_component(
                 "footprint": footprint,
                 "x": x, "y": y, "rotation": rotation, "layer": layer,
                 "source": "file",
-                "warning": FILE_FALLBACK_WARNING
+                "fallback_reason": reason.reason(), "warning": reason.write_warning()
             })))
         }
     }
@@ -2241,7 +2242,7 @@ async fn handle_move_component(
             &json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }),
         )),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(_) => {
+        BoardWrite::File(reason) => {
             match update_closed_board_footprint(
                 &board,
                 &reference,
@@ -2252,7 +2253,7 @@ async fn handle_move_component(
                     "x": x,
                     "y": y,
                     "source": "file",
-                    "warning": FILE_FALLBACK_WARNING
+                    "fallback_reason": reason.reason(), "warning": reason.write_warning()
                 }))),
                 Err(error) => Ok(error.into_result()),
             }
@@ -2345,7 +2346,7 @@ async fn handle_rotate_component(
             "source": "ipc"
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(_) => {
+        BoardWrite::File(reason) => {
             match update_closed_board_footprint(
                 &board,
                 &reference,
@@ -2355,7 +2356,7 @@ async fn handle_rotate_component(
                     "rotated": reference,
                     "rotation": rotation,
                     "source": "file",
-                    "warning": FILE_FALLBACK_WARNING
+                    "fallback_reason": reason.reason(), "warning": reason.write_warning()
                 }))),
                 Err(error) => Ok(error.into_result()),
             }
@@ -2446,12 +2447,12 @@ async fn handle_set_component_placements(
             "undo": "One KiCad undo step reverses the whole placement batch."
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(_) => match update_closed_board_footprints(&board, &placements) {
+        BoardWrite::File(reason) => match update_closed_board_footprints(&board, &placements) {
             Ok(applied) => Ok(CallToolResult::json(&json!({
                 "count": applied.len(),
                 "placements": applied,
                 "source": "file",
-                "warning": FILE_FALLBACK_WARNING
+                "fallback_reason": reason.reason(), "warning": reason.write_warning()
             }))),
             Err(error) => Ok(error.into_result()),
         },
@@ -3153,7 +3154,7 @@ async fn handle_get_component_pads(
         c.get_footprint_pads_in(document, &ipc_reference)
     })
     .await?;
-    match live {
+    let reason = match live {
         // KiCad has the part and reports pads for it.
         Ok(Some(pads)) if !pads.is_empty() => {
             let items: Vec<serde_json::Value> = pads
@@ -3211,8 +3212,8 @@ async fn handle_get_component_pads(
         }
         // Unreachable, or reachable and holding some other board: either way
         // no live KiCad can be answering about this one, so read the file.
-        Err(konnect_ipc::IpcFailure::Unreachable(_))
-        | Err(konnect_ipc::IpcFailure::BoardNotOpen(_)) => {}
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => NoLiveBoard::Unreachable,
+        Err(konnect_ipc::IpcFailure::BoardNotOpen(answer)) => NoLiveBoard::NotOpen(answer),
         // Not that, though. The file is the fallback for a board no editor
         // holds, and an open-document list Konnect could not read does not
         // establish that — a live KiCad may hold newer state, so answering
@@ -3228,7 +3229,7 @@ async fn handle_get_component_pads(
         Err(konnect_ipc::IpcFailure::Rejected(message)) => {
             return Ok(CallToolResult::error(message));
         }
-    }
+    };
 
     let content = std::fs::read_to_string(&board_path)?;
     let tree = konnect_sexp::parser::parse_sexp(&content)?;
@@ -3303,7 +3304,7 @@ async fn handle_get_component_pads(
         "reference": reference,
         "pad_count": pads.len(),
         "pads": pads,
-        "source": "file"
+        "source": "file", "fallback_reason": reason.reason(), "fallback_detail": reason.premise()
     })))
 }
 
@@ -3330,10 +3331,12 @@ async fn handle_get_pad_position(
                     // Carry the pad list's source, so a caller measuring one
                     // pad can still tell whether it measured the live board.
                     let mut pad = pad.clone();
-                    if let (Some(object), Some(source)) =
-                        (pad.as_object_mut(), parsed.get("source"))
-                    {
-                        object.insert("source".to_string(), source.clone());
+                    if let Some(object) = pad.as_object_mut() {
+                        for key in ["source", "fallback_reason", "fallback_detail"] {
+                            if let Some(value) = parsed.get(key) {
+                                object.insert(key.to_string(), value.clone());
+                            }
+                        }
                     }
                     return Ok(CallToolResult::json(&pad));
                 }
@@ -5933,11 +5936,45 @@ mod tests {
         assert!(!res.is_error, "{:?}", res.content);
         let body = parsed(&res);
         assert_eq!(body["source"], json!("file"));
+        assert_eq!(body["fallback_reason"], "ipc_unreachable");
+        assert_eq!(body["fallback_detail"], "KiCad IPC is unreachable.");
         assert_eq!(body["pads"][0]["net"], json!("SAVED"));
         assert_eq!(
             body["pads"][0]["layers"],
             json!(["F.Cu", "F.Paste", "F.Mask"])
         );
+    }
+
+    #[tokio::test]
+    async fn pads_report_positive_board_absence_and_preserve_it_for_one_pad() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        // Reuse the KiCad 10.0.5-resaved fixture and its recorded provenance.
+        std::fs::write(
+            &board,
+            include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb"),
+        )
+        .unwrap();
+        let before = std::fs::read(&board).unwrap();
+        for one_pad in [false, true] {
+            let address =
+                crate::tools::pcb_board::board_mock::spawn_kicad_holding_boards(&[], |_| None);
+            let ctx = ctx_talking_to(address);
+            let args =
+                json!({ "board": board.to_string_lossy(), "reference": "R1", "pad_number": "1" });
+            let result = if one_pad {
+                handle_get_pad_position(&args, &ctx).await.unwrap()
+            } else {
+                handle_get_component_pads(&args, &ctx).await.unwrap()
+            };
+            assert!(!result.is_error, "{:?}", result.content);
+            let body = parsed(&result);
+            assert_eq!(body["fallback_reason"], "board_not_open");
+            let detail = body["fallback_detail"].as_str().unwrap();
+            assert!(detail.contains("No PCB document is open"), "{detail}");
+            assert!(!detail.contains("unreachable"), "{detail}");
+            assert_eq!(std::fs::read(&board).unwrap(), before);
+        }
     }
 
     #[tokio::test]

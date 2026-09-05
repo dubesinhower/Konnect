@@ -47,7 +47,8 @@ sheets, and related schematic concepts.
 
 `crates/konnect-ipc` owns the KiCad IPC client, generated protobuf types, NNG
 request/reply transport, typed board operations, and the distinction between an
-unreachable transport and a request KiCad received and rejected.
+unreachable transport, positive `BoardNotOpen`, ambiguous document identities,
+and a request KiCad received and rejected.
 
 ### Non-workspace and non-Rust boundaries
 
@@ -122,8 +123,12 @@ Board writes use three distinct patterns:
 1. Live IPC handlers call `KiCadIpcClient::ensure_board_is_active` in
    `konnect-ipc/src/client.rs` before changing the editor document.
 2. Hybrid handlers use `attempt_ipc_write` in
-   `konnect-core/src/tools/pcb_board.rs`. Only an unreachable IPC transport may
-   fall back to a file edit; a reached-and-rejected request fails closed.
+   `konnect-core/src/tools/pcb_board.rs`. Unreachable IPC or positively established
+   `BoardNotOpen` may permit file fallback only for a board never observed live
+   during this server session. Ambiguous document identities and reached-and-rejected
+   requests fail closed. Ordinary write results preserve the observed classification
+   in `fallback_reason` and the warning; an unreachable transport does not prove
+   that a board is closed. Saved pad reads retain the reason and its detail too.
 3. File-only board handlers call `refuse_if_board_open_in_kicad` in
    `tools/pcb_board.rs` so KiCad cannot later overwrite an invisible file edit.
 
